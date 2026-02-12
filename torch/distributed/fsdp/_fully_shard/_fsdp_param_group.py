@@ -269,6 +269,8 @@ class FSDPParamGroup:
         # block while this layer's AR is still in flight. See
         # AllReduceState docstring and regression test PR #180900.
         self._all_reduce_state: AllReduceState | None = None
+        # Create a zero buffer for missing parameters
+        self._zero_buf: torch.Tensor | None = None
 
     # Initialization #
     def _init_mp_dtypes(self) -> None:
@@ -279,6 +281,10 @@ class FSDPParamGroup:
         ]
         if trainable_params:
             params_for_dtype = trainable_params
+            grad_type = (
+                trainable_params[0].param_dtype or trainable_params[0].orig_dtype
+            )
+            self._zero_buf = torch.zeros(1, dtype=grad_type, device=self.device)
         else:
             params_for_dtype = [
                 p for p in self.fsdp_params if p.orig_dtype.is_floating_point
@@ -632,35 +638,7 @@ class FSDPParamGroup:
                 # access the unsharded parameters when their data is present
                 fsdp_params_with_grad: list[FSDPParam] = []
                 unsharded_grads: list[torch.Tensor] = []
-            
-                # Models like the Qwen3 with mixture of experts will trigger different experts in different ranks.
-                # This leads to different sets of missing parameters in different ranks,
-                # and thus leading `unsharded_grads` to be different across ranks.
-                # Need a way to account for the "missing" grads that are not in `unsharded_grads` to ensure
-                # reduce-scatter has the same input sizes across ranks.
 
-                # compute total numel of missing grads
-                total_missing_numel = 0
-                grad_dtype: torch.dtype | None = None
-                for fp in self.fsdp_params:
-                    if grad_dtype is None and fp.sharded_param.requires_grad:
-                        grad_dtype = fp.param_dtype or fp.orig_dtype
-                    if (
-                        not self.is_sharded
-                        and hasattr(fp, "_unsharded_param")
-                        and fp.sharded_param.requires_grad
-                        and fp.unsharded_param.grad is None
-                        and fp.unsharded_accumulated_grad is None
-                    ):
-                        total_missing_numel += fp.unsharded_param.data.numel()
-                
-                zero_buf: torch.Tensor | None = None
-                if total_missing_numel > 0:
-                    zero_buf = torch.zeros(
-                        total_missing_numel, dtype=grad_dtype, device=self.device
-                    )
-                    zero_offset = 0
-            
                 for fsdp_param in self.fsdp_params:
                     if not hasattr(fsdp_param, "_unsharded_param"):
                         continue
@@ -679,11 +657,14 @@ class FSDPParamGroup:
                     elif (
                         fsdp_param.sharded_param.requires_grad
                         and not self.is_sharded
-                        and zero_buf is not None
+                        and self._zero_buf is not None
                     ):
-                        numel = fsdp_param.unsharded_param.data.numel()
-                        zero_grad = zero_buf[zero_offset : zero_offset + numel]
-                        zero_offset += numel
+                        # Models like the Qwen3 with mixture of experts will trigger different experts in different ranks.
+                        # This leads to different sets of missing parameters in different ranks,
+                        # and thus leading `unsharded_grads` to be different across ranks.
+                        # Need a way to account for the "missing" grads that are not in `unsharded_grads` to ensure
+                        # reduce-scatter has the same input sizes across ranks.
+                        zero_grad = self._zero_buf.expand(fsdp_param._orig_size)
                         fsdp_params_with_grad.append(fsdp_param)
                         unsharded_grads.append(fsdp_param.unsharded_zero_grad_data)
                 if self.reshard_after_backward:

@@ -340,7 +340,7 @@ def _single_tensor_radam(
             return (bias_correction2**0.5) / exp_avg_sq_sqrt
 
         # Compute the variance rectification term and update parameters accordingly
-        if capturable:
+        if capturable or torch.compiler.is_compiling():
             update = torch.where(
                 rho_t > 5.0, _compute_rect() * _compute_adaptive_lr(), 1.0
             )

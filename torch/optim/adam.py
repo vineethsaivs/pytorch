@@ -474,7 +474,7 @@ def _single_tensor_adam(
         else:
             exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)  # type: ignore[arg-type]
 
-        if capturable or differentiable:
+        if capturable or torch.compiler.is_compiling() or differentiable:
             step = step_t
 
             # Nested if is necessary to bypass jitscript rules

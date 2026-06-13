@@ -6,6 +6,7 @@ import logging
 import os
 import pickle
 import shutil
+import tempfile
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Literal, TYPE_CHECKING
@@ -563,6 +564,96 @@ def standalone_compile(
             )
 
     return CacheCompiledArtifact(compiled_fn, artifacts)
+
+
+def _extract_inductor_output_module(artifact: CompiledArtifact) -> str:
+    """Return the single Inductor output-code module that defines the runnable
+    module-level ``call`` entry point (``call = runner.call``).
+
+    The artifact is unpacked to a temp dir; of the emitted ``.py`` files we want the
+    one exposing ``call``, with its trailing ``__main__`` benchmark block stripped.
+    """
+    chunks: list[str] = []
+    with tempfile.TemporaryDirectory() as unpack_dir:
+        try:
+            artifact.save(path=unpack_dir, format="unpacked")
+        except RuntimeError as e:
+            # The artifact is not saveable, so there is no source to read back. A
+            # common cause is a non-cacheable HOP in the graph (e.g. with_effects);
+            # the underlying error ({e}) names the specific reason.
+            raise NotImplementedError(
+                "compile_to_python cannot lower this graph to standalone source: its "
+                f"Inductor artifact is not saveable ({e})."
+            ) from e
+        for root, _dirs, files in os.walk(unpack_dir):
+            for name in sorted(files):
+                if not name.endswith(".py"):
+                    continue
+                with open(os.path.join(root, name)) as f:
+                    text = f.read()
+                if "def call(" in text and "call = runner.call" in text:
+                    marker = '\nif __name__ == "__main__":'
+                    idx = text.find(marker)
+                    if idx != -1:
+                        text = text[:idx].rstrip() + "\n"
+                    chunks.append(text)
+    if len(chunks) != 1:
+        raise RuntimeError(
+            f"expected exactly one runnable Inductor output module, found "
+            f"{len(chunks)}; compile_standalone_python cannot inline this artifact."
+        )
+    return chunks[0]
+
+
+def _binary_cache_bytes(artifact: CompiledArtifact) -> bytes | None:
+    """Serialize the artifact to opaque cache bytes, or None if it is not
+    serializable (e.g. graphs with input mutations currently do not produce a
+    saveable aot_autograd artifact). The source still runs standalone without it."""
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
+        tmp = tf.name
+    try:
+        artifact.save(path=tmp, format="binary")
+        with open(tmp, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def compile_to_python(
+    gm: GraphModule,
+    example_inputs: Sequence[InputType],
+    *,
+    dynamic_shapes: DynamicShapesType = "from_example_inputs",
+    options: Any = None,
+) -> tuple[str, bytes | None]:
+    """Compile ``gm`` and return ``(inner_python, cache)`` -- the INNER half of the
+    backend contract behind ``torch.precompile``.
+
+    ``inner_python`` is the Inductor output module exposing ``call(args) -> outs``
+    for the post-AOTAutograd inner graph (dense, functionalized). It is the inductor
+    piece only: it carries NO prelude/epilogue (subclass flatten/unflatten, input-
+    mutation copy-back, output-alias regen, grad disabling). Those belong to the AOT
+    layer -- see ``torch._functorch.aot_autograd.compile_to_python``, which calls
+    this and composes AOTAutograd's codegen'd runtime wrappers around the result.
+    Callers must run ``call`` under ``torch.no_grad()`` (the kernels use out= ops).
+
+    The kernels JIT-compile from the inlined source on first call, so ``inner_python``
+    needs no cache. ``cache`` is an opaque acceleration (or ``None`` when the graph
+    is not serializable, e.g. some input-mutating graphs).
+    """
+    with torch.no_grad():
+        artifact = standalone_compile(
+            gm,
+            example_inputs,
+            dynamic_shapes=dynamic_shapes,
+            options=options if options else {},
+        )
+    inner_python = _extract_inductor_output_module(artifact)
+    cache = _binary_cache_bytes(artifact)
+    return inner_python, cache
 
 
 def autograd_cache_key(

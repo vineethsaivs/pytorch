@@ -5,6 +5,7 @@
 #include <torch/csrc/Exceptions.h>
 #include <torch/csrc/PyInterpreter.h>
 #include <torch/csrc/THP.h>
+#include <torch/csrc/autograd/python_context.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/dynamo/compiled_autograd.h>
 #include <torch/csrc/utils/object_ptr.h>
@@ -71,7 +72,7 @@ bool _call_hooks(PyObject* dict, PyObject* args) {
     // not accessible by any other thread
     const auto hook = PyList_GetItem(hooks, idx);
 
-    THPObjectPtr res(PyObject_CallObject(hook, args));
+    THPObjectPtr res(call_with_context(hook, args));
     if (!res)
       throw python_error();
     if (Py_IsNone(res))

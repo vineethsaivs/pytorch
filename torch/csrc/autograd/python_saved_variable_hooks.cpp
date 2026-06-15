@@ -4,6 +4,7 @@
 #include <c10/core/SafePyObject.h>
 #include <torch/csrc/PyInterpreter.h>
 #include <torch/csrc/THP.h>
+#include <torch/csrc/autograd/python_context.h>
 
 namespace py = pybind11;
 
@@ -20,8 +21,11 @@ PySavedVariableHooks::PySavedVariableHooks(
 void PySavedVariableHooks::call_pack_hook(const at::Tensor& tensor) {
   py::gil_scoped_acquire acquire;
   THPObjectPtr obj(THPVariable_Wrap(tensor));
-  THPObjectPtr packed(
-      PyObject_CallFunctionObjArgs(pack_hook_, obj.get(), nullptr));
+  THPObjectPtr args(PyTuple_Pack(1, obj.get()));
+  if (!args) {
+    throw_persisted_python_error();
+  }
+  THPObjectPtr packed(call_with_context(pack_hook_, args.get()));
   if (!packed) {
     throw python_error();
   }
@@ -33,7 +37,11 @@ void PySavedVariableHooks::call_pack_hook(const at::Tensor& tensor) {
 
 at::Tensor PySavedVariableHooks::call_unpack_hook() {
   py::gil_scoped_acquire acquire;
-  THPObjectPtr res(PyObject_CallFunctionObjArgs(unpack_hook_, data_, nullptr));
+  THPObjectPtr args(PyTuple_Pack(1, data_));
+  if (!args) {
+    throw_persisted_python_error();
+  }
+  THPObjectPtr res(call_with_context(unpack_hook_, args.get()));
   if (!res) {
     throw python_error();
   }

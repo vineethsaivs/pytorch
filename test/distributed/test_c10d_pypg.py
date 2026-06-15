@@ -314,6 +314,8 @@ class TestPyProcessGroup(TestCase):
         # dispatches back into Python; a raw C++ ProcessGroup would return the
         # base backend name ("undefined") instead.
         self.assertEqual(pg.name(), "store-pg")
+        self.assertEqual(pg.rank(), 0)
+        self.assertEqual(pg.size(), 1)
 
     def test_coalescing_manager(self):
         # The coalescing manager calls _start_coalescing / _end_coalescing, which

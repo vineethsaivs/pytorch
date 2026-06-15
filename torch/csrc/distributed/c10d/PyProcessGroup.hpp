@@ -85,7 +85,14 @@ class PyProcessGroup : public ProcessGroup {
     py::object pyWork_;
   };
 
-  using ProcessGroup::ProcessGroup;
+  PyProcessGroup(int rank, int size)
+      : ProcessGroup(rank, size), rank_(rank), size_(size) {}
+
+  PyProcessGroup(
+      const c10::intrusive_ptr<::c10d::Store>& store,
+      int rank,
+      int size)
+      : ProcessGroup(store, rank, size), rank_(rank), size_(size) {}
 
   const std::string getBackendName() const override {
     PYBIND11_OVERRIDE(
@@ -96,19 +103,25 @@ class PyProcessGroup : public ProcessGroup {
   }
 
   int getRank() const override {
-    PYBIND11_OVERRIDE(
-        int, /* Return type */
-        ProcessGroup, /* Parent class */
-        getRank, /* Name of function in C++ */
-    );
+    pybind11::gil_scoped_acquire gil;
+    pybind11::function override = pybind11::get_override(
+        static_cast<const ProcessGroup*>(this), "getRank");
+    if (override) {
+      auto o = override();
+      return o.cast<int>();
+    }
+    return rank_;
   }
 
   int getSize() const override {
-    PYBIND11_OVERRIDE(
-        int, /* Return type */
-        ProcessGroup, /* Parent class */
-        getSize, /* Name of function in C++ */
-    );
+    pybind11::gil_scoped_acquire gil;
+    pybind11::function override = pybind11::get_override(
+        static_cast<const ProcessGroup*>(this), "getSize");
+    if (override) {
+      auto o = override();
+      return o.cast<int>();
+    }
+    return size_;
   }
 
   void abort() override {
@@ -370,6 +383,10 @@ class PyProcessGroup : public ProcessGroup {
     }
     return ProcessGroup::endCoalescing(deviceType);
   }
+
+ private:
+  int rank_;
+  int size_;
 };
 
 class TORCH_PYTHON_API PythonOnCompletionHook {

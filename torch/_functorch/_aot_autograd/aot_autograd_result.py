@@ -96,7 +96,7 @@ class BundledOutputCodeLoadable(InductorOutput[TOutputCode], Generic[TOutputCode
 
     def pre_save(self) -> None:
         disk_result = copy(self.result)
-        disk_result.prepare_for_serialization()
+        disk_result.prepare_for_serialization(preserve_original_gm=True)
         self.result = disk_result
         return
 

@@ -28,6 +28,7 @@ from torch._dynamo.utils import counters, ifdynstaticdefault
 from torch._functorch.apis import _DYNAMO_WRAPPER_ATTRS
 from torch._higher_order_ops.hints_wrap import hints_wrapper
 from torch._higher_order_ops.wrap import wrap
+from torch._inductor.utils import fresh_cache
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
     ops,
@@ -6170,6 +6171,57 @@ class GraphModule(torch.nn.Module):
             "Calling torch.func.jvp\\(compiled_fn\\) function from eager mode is not supported",
         ):
             torch.func.jvp(fn, (x,), (x,))
+
+    def test_forward_ad_dual_input_inductor(self):
+        if not torch._dynamo.is_inductor_supported():
+            raise unittest.SkipTest("requires inductor")
+
+        def wrapped_fn(x):
+            return (x**2).sum()
+
+        x = torch.tensor([0.1, 0.2, 0.3])
+        v = torch.ones(3)
+        expected = torch.tensor(1.2)
+
+        def check_dual_tangent(fn):
+            with torch.autograd.forward_ad.dual_level():
+                dual_input = torch.autograd.forward_ad.make_dual(x, v)
+                out = fn(dual_input)
+                tangent = torch.autograd.forward_ad.unpack_dual(out).tangent
+
+            self.assertIsNotNone(tangent)
+            self.assertEqual(tangent, expected)
+
+        with fresh_cache(), torch._inductor.config.patch(fx_graph_cache=True):
+            for enable_autograd_cache in (False, True):
+                for warmup in (False, True):
+                    with torch._functorch.config.patch(
+                        enable_autograd_cache=enable_autograd_cache
+                    ):
+                        torch._dynamo.reset()
+                        fn = torch.compile(backend="inductor", fullgraph=True)(
+                            wrapped_fn
+                        )
+
+                        if warmup:
+                            self.assertEqual(fn(x), wrapped_fn(x))
+
+                        check_dual_tangent(fn)
+
+        with (
+            fresh_cache(),
+            torch._functorch.config.patch(
+                enable_autograd_cache=True, bundled_autograd_cache=True
+            ),
+        ):
+            for warmup in (False, True):
+                torch._dynamo.reset()
+                fn = torch.compile(backend="inductor", fullgraph=True)(wrapped_fn)
+
+                if warmup:
+                    self.assertEqual(fn(x), wrapped_fn(x))
+
+                check_dual_tangent(fn)
 
     @config.patch(error_on_recompile=True)
     def test_grad_recompile(self):

@@ -279,7 +279,7 @@ class AOTEagerOutputCode(OutputCode):
             raise AssertionError("gm must not be None")
         return self.gm.forward(inputs)
 
-    def prepare_for_serialization(self) -> None:
+    def prepare_for_serialization(self, preserve_original_gm: bool = True) -> None:
         from torch.fx._graph_pickler import GraphPickler, Options
 
         if self.gm is None:

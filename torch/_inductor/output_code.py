@@ -23,6 +23,7 @@ serialized format:
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import logging
 import os
@@ -79,6 +80,27 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _boxed_inputs_have_forward_grad(inputs: Sequence[Any]) -> bool:
+    if torch.autograd.forward_ad._current_level < 0:
+        return False
+
+    for value in inputs:
+        if isinstance(value, torch.Tensor):
+            tangent = torch.autograd.forward_ad.unpack_dual(value).tangent
+            if tangent is not None:
+                return True
+    return False
+
+
+def _copy_graph_module_without_metadata(
+    gm: torch.fx.GraphModule,
+) -> torch.fx.GraphModule:
+    gm_copy = copy.deepcopy(gm)
+    for node in gm_copy.graph.nodes:
+        node.meta.clear()
+    return gm_copy
+
+
 @dataclasses.dataclass
 class OutputCode:
     # TODO: Remove underscores here
@@ -95,7 +117,7 @@ class OutputCode:
     def __call__(self, inputs: Sequence[Any]) -> Any:
         raise NotImplementedError(type(self))
 
-    def prepare_for_serialization(self) -> None:
+    def prepare_for_serialization(self, preserve_original_gm: bool = True) -> None:
         raise NotImplementedError(type(self))
 
     def post_compile(
@@ -541,6 +563,7 @@ class CompiledFxGraph(OutputCode):
     # (including aliasing) from the input shapes.
     _original_gm: torch.fx.GraphModule | None = None
     _serialized_original_gm: bytes | None = None
+    _original_gm_for_serialization: torch.fx.GraphModule | None = None
 
     def __init__(
         self,
@@ -716,16 +739,35 @@ class CompiledFxGraph(OutputCode):
         # This is set at compile time to avoid runtime overhead
         self._wrap_compiled_regions = config.wrap_inductor_compiled_regions
 
-        if self._wrap_compiled_regions:
-            # Store a metadata-stripped copy of the FX graph. Running this
-            # under FakeTensorMode re-derives output shapes and aliasing
-            # from the input fake tensors.
-            import copy
+        if config.wrap_inductor_compiled_regions:
+            # Store a metadata-stripped copy of the FX graph for runtime
+            # fallbacks/wrappers that may need eager FX execution after the
+            # compiled callable has been serialized.
+            self._original_gm = _copy_graph_module_without_metadata(gm)
+        self._original_gm_for_serialization = gm
 
-            gm_copy = copy.deepcopy(gm)
-            for node in gm_copy.graph.nodes:
-                node.meta.clear()
-            self._original_gm = gm_copy
+    def _load_original_gm(self) -> torch.fx.GraphModule | None:
+        if self._original_gm is not None:
+            return self._original_gm
+        if self._serialized_original_gm is None:
+            return None
+
+        from torch._subclasses import FakeTensorMode
+        from torch.fx._graph_pickler import GraphPickler
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        fake_mode = FakeTensorMode(
+            allow_non_fake_inputs=True,
+            shape_env=ShapeEnv(),
+        )
+        original_gm = cast(
+            torch.fx.GraphModule,
+            GraphPickler.loads(self._serialized_original_gm, fake_mode),
+        )
+        original_gm.recompile()
+        self._original_gm = original_gm
+        self._serialized_original_gm = None
+        return self._original_gm
 
     def __del__(self) -> None:
         if self.compiled_fn_runner is not None:
@@ -914,22 +956,38 @@ class CompiledFxGraph(OutputCode):
             self.mutated_input_idxs,
         )
 
-        if self._original_gm is None and self._serialized_original_gm is not None:
-            from torch._subclasses import FakeTensorMode
-            from torch.fx._graph_pickler import GraphPickler
-            from torch.fx.experimental.symbolic_shapes import ShapeEnv
+        if (
+            self._original_gm is None
+            and self._wrap_compiled_regions
+            and isinstance(constants, CompiledFxGraphConstantsWithGm)
+        ):
+            self._original_gm = _copy_graph_module_without_metadata(constants.gm)
+        if self._wrap_compiled_regions:
+            self._load_original_gm()
 
-            fake_mode = FakeTensorMode(
-                allow_non_fake_inputs=True,
-                shape_env=ShapeEnv(),
-            )
-            original_gm = cast(
-                torch.fx.GraphModule,
-                GraphPickler.loads(self._serialized_original_gm, fake_mode),
-            )
-            original_gm.recompile()
-            self._original_gm = original_gm
-            self._serialized_original_gm = None
+        fallback_gm = (
+            constants.gm
+            if isinstance(constants, CompiledFxGraphConstantsWithGm)
+            else self._original_gm
+        )
+        if self.current_callable is not None:
+            original_callable = self.current_callable
+
+            def forward_ad_fallback(inputs):
+                if _boxed_inputs_have_forward_grad(inputs):
+                    gm = fallback_gm
+                    if gm is None:
+                        gm = self._load_original_gm()
+                    if gm is None:
+                        raise RuntimeError(
+                            "Inductor received forward AD inputs, but the original "
+                            "FX graph is unavailable for tangent-preserving fallback."
+                        )
+                    counters["inductor"]["forward_ad_fallback"] += 1
+                    return gm.forward(*inputs)
+                return original_callable(inputs)
+
+            self.current_callable = forward_ad_fallback
 
         # Apply inductor_compiled_code HOP wrapper if configured
         # This is done in post_compile to ensure it works with cached artifacts
@@ -960,7 +1018,7 @@ class CompiledFxGraph(OutputCode):
     def set_triton_bundle(self, triton_bundle: Any) -> None:
         self._triton_bundle = triton_bundle
 
-    def prepare_for_serialization(self) -> None:
+    def prepare_for_serialization(self, preserve_original_gm: bool = True) -> None:
         # We can't really serialize callables that may be C++/Triton/etc.,
         # so we serialize their PyCodeCache disk cache location instead.
         # TODO: This could be better if we're ever able to serialize compiled
@@ -969,13 +1027,26 @@ class CompiledFxGraph(OutputCode):
         self.current_callable = None
         self.recursively_apply_fns = None
         self.compiled_fn_runner = None
-        if self._original_gm is not None:
+        if preserve_original_gm and (
+            self._original_gm is not None
+            or self._original_gm_for_serialization is not None
+        ):
             from torch.fx._graph_pickler import GraphPickler, Options
 
+            original_gm = self._original_gm
+            if original_gm is None:
+                if self._original_gm_for_serialization is None:
+                    raise AssertionError(
+                        "self._original_gm_for_serialization must not be None"
+                    )
+                original_gm = _copy_graph_module_without_metadata(
+                    self._original_gm_for_serialization
+                )
             self._serialized_original_gm = GraphPickler.dumps(
-                self._original_gm, Options(ops_filter=None)
+                original_gm, Options(ops_filter=None)
             )
-            self._original_gm = None
+        self._original_gm = None
+        self._original_gm_for_serialization = None
         # Note: _serialized_fx_graph is already in serializable form (SerializedGraphModule)
         # so it doesn't need to be cleared
 
@@ -1102,7 +1173,7 @@ class CompiledAOTI(OutputCode):
             raise RuntimeError("AOTInductor compiled so is not loaded")
         return self.current_callable(inputs)
 
-    def prepare_for_serialization(self) -> None:
+    def prepare_for_serialization(self, preserve_original_gm: bool = True) -> None:
         self.current_callable = None
         self._cached_files = {}
         filenames: list[str] = []
@@ -1288,7 +1359,7 @@ class RegionalOutputCode(OutputCode):
     def set_triton_bundle(self, triton_bundle: Any) -> None:
         """Regional inductor doesn't use triton bundles directly."""
 
-    def prepare_for_serialization(self) -> None:
+    def prepare_for_serialization(self, preserve_original_gm: bool = True) -> None:
         """
         Prepare for serialization by converting the GraphModule to bytes.
 

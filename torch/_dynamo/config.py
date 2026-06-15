@@ -189,6 +189,11 @@ automatic_dynamic_shapes = (
 # Valid options: "dynamic", "unbacked"
 automatic_dynamic_shapes_mark_as: Literal["dynamic", "unbacked"] = "dynamic"
 
+# Make explicitly marked-unbacked tensor strides unbacked too, avoiding
+# recompiles from 0/1 stride specialization. Disable to restore the older
+# conservative stride-specialized behavior while keeping marked sizes unbacked.
+mark_unbacked_strides: bool = True
+
 # When True, adds exclusion guards for tensor dims and scalars that transition
 # from static to dynamic via automatic_dynamic_shapes.
 #

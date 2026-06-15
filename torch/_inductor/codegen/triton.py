@@ -1874,6 +1874,30 @@ class TritonOverrides(OpOverrides):
         return f"libdevice.lgamma({x})"
 
     @staticmethod
+    # pyrefly: ignore [bad-override]
+    def neg(x):
+        dtype = triton_arg_dtype(x)
+        if dtype is not None and dtype.is_floating_point:
+            value = OpOverrides.paren(x)
+            if dtype in (torch.float16, torch.bfloat16):
+                triton_dtype = triton_type(dtype)
+                return (
+                    f"({value}.to(tl.uint16, bitcast=True) ^ "
+                    f"tl.full([], 0x8000, tl.uint16)).to({triton_dtype}, bitcast=True)"
+                )
+            if dtype == torch.float32:
+                return (
+                    f"({value}.to(tl.uint32, bitcast=True) ^ "
+                    f"tl.full([], 0x80000000, tl.uint32)).to(tl.float32, bitcast=True)"
+                )
+            if dtype == torch.float64:
+                return (
+                    f"({value}.to(tl.uint64, bitcast=True) ^ "
+                    f"tl.full([], 0x8000000000000000, tl.uint64)).to(tl.float64, bitcast=True)"
+                )
+        return f"-{x}"
+
+    @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def erf(x):

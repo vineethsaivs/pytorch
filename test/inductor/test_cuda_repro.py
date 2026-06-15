@@ -3154,6 +3154,38 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         self.common(fn, [x])
 
     @unittest.skipIf(not TEST_CUDA, "requires CUDA")
+    def test_neg_preserves_signed_zero(self):
+        def fn(x):
+            return -x
+
+        dtypes = [torch.float16, torch.float32, torch.float64]
+        if torch.cuda.is_bf16_supported():
+            dtypes.append(torch.bfloat16)
+
+        for dtype in dtypes:
+            x = torch.tensor([0.0, -0.0, 1.0, -1.0], device=device_type, dtype=dtype)
+            actual = torch.compile(fn, backend="inductor", fullgraph=True)(x)
+            expected = fn(x)
+            self.assertEqual(actual, expected)
+            self.assertEqual(torch.signbit(actual), torch.signbit(expected))
+
+    @unittest.skipIf(not TEST_CUDA, "requires CUDA")
+    def test_special_log_ndtr_preserves_signed_zero(self):
+        def fn(x):
+            y = torch.special.log_ndtr(x)
+            return y, torch.copysign(torch.ones_like(y), y)
+
+        x = torch.tensor([100.0], device=device_type, dtype=torch.float32)
+        actual_y, actual_copysign = torch.compile(
+            fn, backend="inductor", fullgraph=True
+        )(x)
+        expected_y, expected_copysign = fn(x)
+
+        self.assertEqual(actual_y.view(torch.uint32), expected_y.view(torch.uint32))
+        self.assertEqual(torch.signbit(actual_y), torch.signbit(expected_y))
+        self.assertEqual(actual_copysign, expected_copysign)
+
+    @unittest.skipIf(not TEST_CUDA, "requires CUDA")
     @skipIfRocm(msg="PTX atan codegen is CUDA-specific")
     @skipIfXpu(msg="PTX atan codegen is CUDA-specific")
     def test_atan_special_psi_eager_parity(self):

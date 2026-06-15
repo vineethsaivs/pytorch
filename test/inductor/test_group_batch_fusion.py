@@ -1437,5 +1437,98 @@ class TestFindIndependentSubsetGreedy(TestCase):
         self.assertRaises(StopIteration, lambda: next(i))
 
 
+class CatLinearMod(torch.nn.Module):
+    # linear(cat(parts, dim=cat_dim)). cat_dim=-1 is the matchable shape.
+    def __init__(self, widths, out_features, has_bias=True, cat_dim=-1, device="cpu"):
+        super().__init__()
+        self.cat_dim = cat_dim
+        # when the cat is not on the last dim the feature width is unchanged,
+        # so the linear contracts a single part's width
+        in_features = sum(widths) if cat_dim == -1 else widths[0]
+        self.lin = torch.nn.Linear(in_features, out_features, bias=has_bias).to(device)
+
+    def forward(self, parts):
+        x = torch.cat(parts, dim=self.cat_dim)
+        return self.lin(x)
+
+
+class CatLinearTwoUserMod(torch.nn.Module):
+    # the cat feeds the linear *and* a second consumer, so it can't be erased.
+    def __init__(self, widths, out_features, device="cpu"):
+        super().__init__()
+        self.lin = torch.nn.Linear(sum(widths), out_features).to(device)
+
+    def forward(self, parts):
+        x = torch.cat(parts, dim=-1)
+        return self.lin(x), x.sum()
+
+
+@torch._inductor.config.patch(
+    pre_grad_fusion_options={"cat_linear": {}},
+    post_grad_fusion_options={},
+)
+class TestCatLinearFusion(TestCase):
+    def _fires(self, module, parts):
+        counters.clear()
+        traced = torch.compile(module)
+        traced(parts)
+        n = counters["inductor"]["cat_linear"]
+        counters.clear()
+        return n
+
+    def test_cat_linear_two_part(self):
+        m = CatLinearMod([16, 16], 32)
+        parts = [torch.randn(4, 16), torch.randn(4, 16)]
+        self.assertEqual(self._fires(m, parts), 1)
+
+    def test_cat_linear_three_part(self):
+        m = CatLinearMod([16, 16, 16], 32)
+        parts = [torch.randn(4, 16) for _ in range(3)]
+        self.assertEqual(self._fires(m, parts), 1)
+
+    def test_cat_linear_rejects_non_last_dim(self):
+        m = CatLinearMod([16, 16], 16, cat_dim=0)
+        parts = [torch.randn(4, 16), torch.randn(4, 16)]
+        self.assertEqual(self._fires(m, parts), 0)
+
+    def test_cat_linear_rejects_too_many_parts(self):
+        m = CatLinearMod([16, 16, 16, 16], 32)
+        parts = [torch.randn(4, 16) for _ in range(4)]
+        self.assertEqual(self._fires(m, parts), 0)
+
+    def test_cat_linear_rejects_over_width(self):
+        m = CatLinearMod([256, 256], 32)
+        parts = [torch.randn(4, 256), torch.randn(4, 256)]
+        self.assertEqual(self._fires(m, parts), 0)
+
+    def test_cat_linear_rejects_thin_piece(self):
+        m = CatLinearMod([4, 16], 32)
+        parts = [torch.randn(4, 4), torch.randn(4, 16)]
+        self.assertEqual(self._fires(m, parts), 0)
+
+    def test_cat_linear_rejects_multi_user_cat(self):
+        m = CatLinearTwoUserMod([16, 16], 32)
+        parts = [torch.randn(4, 16), torch.randn(4, 16)]
+        self.assertEqual(self._fires(m, parts), 0)
+
+    @requires_gpu()
+    def test_cat_linear_numerics(self):
+        for has_bias in [True, False]:
+            counters.clear()
+            torch._dynamo.reset()
+            module = CatLinearMod(
+                [176, 176], 256, has_bias=has_bias, device=GPU_TYPE
+            ).to(torch.bfloat16)
+            parts = [
+                torch.randn(64, 176, device=GPU_TYPE, dtype=torch.bfloat16),
+                torch.randn(64, 176, device=GPU_TYPE, dtype=torch.bfloat16),
+            ]
+            ref = module(parts)
+            res = torch.compile(module)(parts)
+            self.assertEqual(counters["inductor"]["cat_linear"], 1)
+            self.assertEqual(ref, res, rtol=1.6e-2, atol=1e-2)
+            counters.clear()
+
+
 if __name__ == "__main__":
     run_tests()

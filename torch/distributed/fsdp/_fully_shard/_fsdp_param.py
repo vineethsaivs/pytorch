@@ -934,7 +934,12 @@ class FSDPParam:
 
     @property
     def unsharded_zero_grad_data(self) -> torch.Tensor:
-        return self._get_grad_inner_tensor(self._zero_buf.expand(self._orig_size))
+        if self.is_dtensor:
+            # for spmd and advance tensor parallelism
+            return self._get_grad_inner_tensor(torch.zeros_like(self.unsharded_param))
+        else:
+            # for regular fsdp
+            return self._get_grad_inner_tensor(self._zero_buf.expand(self._orig_size))
 
     def _get_grad_inner_tensor(self, grad: torch.Tensor) -> torch.Tensor:
         if self.is_dtensor:

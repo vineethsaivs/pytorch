@@ -800,17 +800,29 @@ class FSDPParamGroup:
         self.comm_ctx._last_post_reduce_events = dict()
         self._post_reduce_event = None
         self._all_reduce_state = None
+        globally_used: torch.Tensor | None = None
+        if self._locally_unused_params:
+            globally_used = torch.ones(
+                len(self.fsdp_params), dtype=torch.uint8, device=self.device
+            )
+            for i in self._locally_unused_params:
+                globally_used[i] = 0
+            dist.all_reduce(
+                globally_used,
+                op=dist.ReduceOp.MAX,
+                group=self._reduce_scatter_process_group,
+            )
+            # do bulk transfer once (typically < 100 bytes)
+            globally_used = globally_used.cpu()
         for i, fsdp_param in enumerate(self.fsdp_params):
-            # For unused parameters, we set their gradients to None to avoid optimizer issues
-            # (e.g. with momentum or adaptive methods) else keep the zero gradients for legitimate parameters
-            # to ensure consistent sharded parameters across ranks.
-            if (
-                i in self._locally_unused_params
-                and fsdp_param.sharded_param.grad is not None
-                and hasattr(fsdp_param.sharded_param.grad, "_local_tensor")
-                and not fsdp_param.sharded_param.grad._local_tensor.any()  # This .any is a host to device sync. Defer to async?
+            if fsdp_param.sharded_param.grad is not None and hasattr(
+                fsdp_param.sharded_param.grad, "_local_tensor"
             ):
-                fsdp_param.sharded_param.grad = None
+                local_grad = fsdp_param.sharded_param.grad._local_tensor
+                if local_grad.numel() == 0 or (
+                    globally_used is not None and not globally_used[i]
+                ):
+                    fsdp_param.sharded_param.grad = None
 
             if fsdp_param.grad_offload_event is not None:
                 fsdp_param.grad_offload_event.synchronize()

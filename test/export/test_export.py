@@ -6354,12 +6354,7 @@ def forward(self, p_linear_weight, p_linear_bias, b_buffer, x):
             (torch.randn(2, 2), torch.randn(3, 2)),
             dynamic_shapes=({0: dx, 1: None}, {0: dx + 1, 1: None}),
         )
-        with self.assertRaisesRegex(
-            AssertionError,
-            escape("Guard failed: -1 + y.size()[0] != 1"),
-        ):
-            # TODO: this should not error?
-            ep.module()(torch.randn(1, 2), torch.randn(2, 2))
+        ep.module()(torch.randn(1, 2), torch.randn(2, 2))
         range_lower_bounds = sorted(vr.lower for vr in ep.range_constraints.values())
         range_upper_bounds = sorted(vr.upper for vr in ep.range_constraints.values())
         self.assertEqual(range_lower_bounds, [1, 2])
@@ -17394,7 +17389,7 @@ def forward(self, x):
                 for node in ep.graph.nodes
             ].count(True)
             if private_api:
-                self.assertEqual(num_asserts, 6)
+                self.assertEqual(num_asserts, 4)
                 with self.assertRaisesRegex(
                     RuntimeError,
                     r"Runtime assertion failed for expression Eq\(Mod\(s27\*s77, s77 - 1\), 0\)",

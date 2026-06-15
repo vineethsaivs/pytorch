@@ -3522,7 +3522,7 @@ class ExpandView(BaseView):
             if len(index) != len(actual):
                 raise AssertionError("Expected len(index) == len(actual)")
             for i in range(len(actual)):
-                if actual[i] == 1:
+                if V.graph.sizevars.is_size_one_or_false(actual[i]):
                     # zero out broadcast dimension
                     index[i] = sympy.S.Zero
             return index

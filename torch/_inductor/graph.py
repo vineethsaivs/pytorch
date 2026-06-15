@@ -1842,19 +1842,30 @@ class GraphLowering(torch.fx.Interpreter):
         """Get the user-annotated stream index from FX node metadata."""
         return n.meta.get("custom", {}).get("stream")
 
-    def _realize_inputs_at_stream_boundaries(self, n: torch.fx.Node) -> None:
-        """Realize IR inputs that are on a different stream.
+    @staticmethod
+    def _get_node_mempool(n: torch.fx.Node) -> tuple[int, int] | None:
+        """Get the user-annotated CUDA MemPool from FX node metadata."""
+        custom = n.meta.get("custom", {})
+        if "mempool" not in custom:
+            return None
+        return custom["mempool"], custom["mempool_device"]
 
-        Without this, pointwise ops across stream boundaries would be inlined
+    def _realize_inputs_at_context_boundaries(self, n: torch.fx.Node) -> None:
+        """Realize IR inputs that are in a different stream or mempool context.
+
+        Without this, pointwise ops across context boundaries would be inlined
         into each other during lowering, making it impossible for the scheduler
-        to split them into separate kernels.
+        to split them into separate kernels or allocate buffers in the right
+        memory pool.
 
         None means the default stream, so it is compared like any other value.
         """
         node_stream = self._get_node_stream(n)
+        node_mempool = self._get_node_mempool(n)
         for input_node in n.all_input_nodes:
             input_stream = self._get_node_stream(input_node)
-            if input_stream == node_stream:
+            input_mempool = self._get_node_mempool(input_node)
+            if input_stream == node_stream and input_mempool == node_mempool:
                 continue
             ir_value = self.env.get(input_node)
             if isinstance(ir_value, ir.TensorBox):
@@ -1901,13 +1912,27 @@ class GraphLowering(torch.fx.Interpreter):
         # origins: OrderedSet[Union[Node, ir.IRNode]] = OrderedSet([n])
         origins: OrderedSet[Any] = OrderedSet([n])
         is_call_function = n.op == "call_function"
+        if (
+            is_call_function
+            and isinstance(n.target, torch._ops.OpOverload)
+            and n.target.name() in ("mempool::begin", "mempool::end")
+        ):
+            # Drop marker ops; codegen reintroduces use_mem_pool blocks from
+            # per-node metadata around scheduler nodes that may allocate.
+            return None
         if is_call_function:
             args, kwargs = self.fetch_args_kwargs_from_env(n)
             origins |= gather_origins(args, kwargs)
-            self._realize_inputs_at_stream_boundaries(n)
+            self._realize_inputs_at_context_boundaries(n)
+        node_mempool = self._get_node_mempool(n)
+        if node_mempool is not None and self.disable_cudagraphs_reason is None:
+            self.disable_cudagraphs_reason = (
+                "user CUDA MemPool contexts are not compatible with CUDA graphs"
+            )
         with (
             ir.IRNode.current_origins(origins),
             ir.IRNode.current_stream_idx(self._get_node_stream(n)),
+            ir.IRNode.current_mempool(node_mempool),
             self.set_current_node(n),
             V.set_current_node(n),
         ):

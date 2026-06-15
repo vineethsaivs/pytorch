@@ -702,6 +702,8 @@ class TestScheduler(TestCase):
             scheduler = Scheduler.__new__(Scheduler)
             scheduler.mutation_renames = {}
             scheduler._has_multi_stream_nodes = Mock(return_value=False)
+            scheduler._mempool_nodes = False
+            scheduler.node_to_mempool = {}
             scheduler._nested_index_equivalent_dep_names = Mock(
                 return_value=OrderedSet()
             )

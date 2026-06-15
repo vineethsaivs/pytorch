@@ -70,7 +70,6 @@ from ..utils import (
     dict_methods,
     extract_fake_example_value,
     get_fake_value,
-    guard_if_dyn,
     is_tensor_getset_descriptor,
     is_wrapper_or_member_descriptor,
     istype,
@@ -2043,10 +2042,10 @@ class BuiltinVariable(BaseBuiltinVariable):
             raise_type_error(tx, "range expected at least 1 argument, got 0")
         if len(args) > 3:
             raise_type_error(tx, f"range expected at most 3 arguments, got {len(args)}")
+        args = tuple(arg.nb_index_impl(tx) for arg in args)
         if check_unspec_or_constant_args(args, {}):
             return variables.RangeVariable(list(args))
         elif self._dynamic_args(*args):
-            args = tuple(VariableTracker.build(tx, guard_if_dyn(arg)) for arg in args)
             return variables.RangeVariable(list(args))
         # None no-ops this handler and lets the driving function proceed
         return None

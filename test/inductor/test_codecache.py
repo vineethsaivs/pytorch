@@ -3323,6 +3323,93 @@ class TestFxGraphCacheHashing(TestCase):
         details = FxGraphHashDetails(gm, example_inputs, cast(Any, {}), [])
         return FxGraphCachePickler(gm).get_key(details)
 
+    def _custom_op_schema_cache_key(self, mutates_out, target_kind, namespace):
+        script = textwrap.dedent(
+            """
+            import json
+            import os
+            import torch
+            from torch._inductor.codecache import FxGraphCachePickler, FxGraphHashDetails
+            from torch._subclasses import FakeTensorMode
+            from torch.library import Library, infer_schema
+
+            namespace = os.environ["OP_NAMESPACE"]
+            lib = Library(namespace, "FRAGMENT")
+
+            def mul_out(x: torch.Tensor, y: torch.Tensor, *, out: torch.Tensor) -> None:
+                pass
+
+            schema = infer_schema(
+                mul_out,
+                mutates_args=["out"] if os.environ["MUTATES_OUT"] == "1" else [],
+            )
+            lib.define("test_fx_graph_cache_schema_key_mul" + schema)
+            packet = getattr(
+                getattr(torch.ops, namespace), "test_fx_graph_cache_schema_key_mul"
+            )
+            op = packet.default
+            target = (
+                packet
+                if os.environ["TARGET_KIND"] == "packet"
+                else op
+            )
+
+            graph = torch.fx.Graph()
+            x = graph.placeholder("x")
+            y = graph.placeholder("y")
+            out = graph.placeholder("out")
+            graph.call_function(target, (x, y), {"out": out})
+            graph.output(out)
+            gm = torch.fx.GraphModule({}, graph)
+
+            with FakeTensorMode():
+                example_inputs = [torch.empty(2), torch.empty(2), torch.empty(2)]
+            details = FxGraphHashDetails(gm, example_inputs, {}, [])
+            key = FxGraphCachePickler(gm).get_key(details)
+            print(json.dumps({
+                "key": key,
+                "schema": str(op._schema),
+            }))
+            """
+        )
+        env = {
+            **os.environ,
+            "MUTATES_OUT": "1" if mutates_out else "0",
+            "TARGET_KIND": target_kind,
+            "OP_NAMESPACE": namespace,
+        }
+        output = subprocess.check_output(
+            [sys.executable, "-c", script],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            env=env,
+            text=True,
+        )
+        return json.loads(output.strip().splitlines()[-1])
+
+    def test_custom_op_schema_mutability_affects_cache_key(self):
+        for namespace in ("test_fx_graph_cache_schema_key", "aten"):
+            for target_kind in ("overload", "packet"):
+                non_mutating = self._custom_op_schema_cache_key(
+                    mutates_out=False,
+                    target_kind=target_kind,
+                    namespace=namespace,
+                )
+                mutating = self._custom_op_schema_cache_key(
+                    mutates_out=True,
+                    target_kind=target_kind,
+                    namespace=namespace,
+                )
+
+                self.assertEqual(
+                    non_mutating["schema"],
+                    f"{namespace}::test_fx_graph_cache_schema_key_mul(Tensor x, Tensor y, *, Tensor out) -> ()",
+                )
+                self.assertEqual(
+                    mutating["schema"],
+                    f"{namespace}::test_fx_graph_cache_schema_key_mul(Tensor x, Tensor y, *, Tensor(a2!) out) -> ()",
+                )
+                self.assertNotEqual(non_mutating["key"], mutating["key"])
+
     def _no_input_factory_graph(self, device=None):
         graph = torch.fx.Graph()
         kwargs: dict[str, Any] = {"dtype": torch.float32}

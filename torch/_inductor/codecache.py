@@ -577,6 +577,76 @@ def _unpicklable_error(key: str) -> NoReturn:
     )
 
 
+def _op_overload_cache_key(
+    op: torch._ops.OpOverload,
+) -> tuple[str, str, str, tuple[str, ...]]:
+    schema = op._schema
+    return (
+        schema.name,
+        schema.overload_name,
+        str(schema),
+        tuple(sorted(str(tag) for tag in op.tags)),
+    )
+
+
+_BUILTIN_OP_NAMESPACES = OrderedSet(["aten", "prim", "prims"])
+
+
+def _needs_explicit_schema_cache_key(op: torch._ops.OpOverload) -> bool:
+    if op.namespace not in _BUILTIN_OP_NAMESPACES:
+        return True
+    return op._defined_in_python
+
+
+def _op_overload_packet_cache_key(
+    packet: torch._ops.OpOverloadPacket,
+) -> tuple[tuple[str, str, str, tuple[str, ...]], ...]:
+    details = []
+    for overload_name in packet._schemas:
+        attr = "default" if overload_name == "" else overload_name
+        overload = getattr(packet, attr)
+        if _needs_explicit_schema_cache_key(overload):
+            details.append(_op_overload_cache_key(overload))
+    return tuple(sorted(details))
+
+
+def _record_op_overload_schema_details(
+    value: Any,
+    result: dict[tuple[str, str, str, tuple[str, ...]], None],
+) -> None:
+    if isinstance(value, torch._ops.OpOverload):
+        if not _needs_explicit_schema_cache_key(value):
+            return
+        result[_op_overload_cache_key(value)] = None
+        return
+    if isinstance(value, torch._ops.OpOverloadPacket):
+        for detail in _op_overload_packet_cache_key(value):
+            result[detail] = None
+        return
+    if isinstance(value, torch.fx.Node):
+        return
+    if isinstance(value, (list, tuple, OrderedSet, frozenset)):
+        for item in value:
+            _record_op_overload_schema_details(item, result)
+    elif isinstance(value, dict):
+        for item in itertools.chain(value.keys(), value.values()):
+            _record_op_overload_schema_details(item, result)
+
+
+def _get_op_overload_schema_details(
+    gm: torch.fx.GraphModule,
+) -> list[tuple[str, str, str, tuple[str, ...]]]:
+    result: dict[tuple[str, str, str, tuple[str, ...]], None] = {}
+    for module in gm.modules():
+        if not isinstance(module, torch.fx.GraphModule):
+            continue
+        for node in module.graph.nodes:
+            _record_op_overload_schema_details(node.target, result)
+            _record_op_overload_schema_details(node.args, result)
+            _record_op_overload_schema_details(node.kwargs, result)
+    return sorted(result)
+
+
 def extract_tensor_metadata_for_cache_key(t: Tensor) -> TensorMetadata:
     """
     Extracts the tensor metadata and removes fields of the TensorMetadata
@@ -671,6 +741,10 @@ class FxGraphCachePickler(pickle.Pickler):
                 torch.nn.parameter.Parameter: functools.partial(self._reduce_tensor),
                 torch.SymInt: functools.partial(self._reduce_symint),
                 torch.SymBool: functools.partial(self._reduce_symbool),
+                torch._ops.OpOverload: functools.partial(self._reduce_op_overload),
+                torch._ops.OpOverloadPacket: functools.partial(
+                    self._reduce_op_overload_packet
+                ),
                 torch.fx.experimental._backward_state.BackwardState: functools.partial(
                     self._reduce_unsupported
                 ),
@@ -678,7 +752,8 @@ class FxGraphCachePickler(pickle.Pickler):
             }
         )
         if has_user_defined_triton_kernels:
-            # Need to use runtime type as GraphModule generates a singleton in __new__ function
+            # Need to use runtime type as GraphModule generates a singleton in
+            # __new__ function.
             self.dispatch_table[gm.__class__] = functools.partial(
                 self._reduce_graph_module
             )
@@ -697,6 +772,10 @@ class FxGraphCachePickler(pickle.Pickler):
         is sufficient for cache-key hashing.
         """
         t = type(obj)
+        if isinstance(obj, torch._ops.OpOverload):
+            return self._reduce_op_overload(obj)
+        if isinstance(obj, torch._ops.OpOverloadPacket):
+            return self._reduce_op_overload_packet(obj)
         # Types already registered or handled by default pickle.
         # Use isinstance for _PICKLE_NATIVE_TYPES to cover subclasses
         # (e.g. ABCMeta is a subclass of type, and pickle handles all
@@ -800,6 +879,41 @@ class FxGraphCachePickler(pickle.Pickler):
         # Same approach as _reduce_symint: use the string representation for
         # hashing.  Guards ensure correctness on cache reload.
         return (_ident, (str(s),))
+
+    def _reduce_op_overload(
+        self, op: torch._ops.OpOverload
+    ) -> tuple[
+        Callable[[T], T],
+        tuple[tuple[str, str, str, tuple[str, ...]]],
+    ]:
+        """
+        Custom reducer to pickle OpOverloads.
+
+        Default pickling identifies an overload by its qualified name, which is
+        not enough for custom ops whose schema can change across processes while
+        keeping the same name.
+        """
+        return (
+            _ident,
+            (_op_overload_cache_key(op),),
+        )
+
+    def _reduce_op_overload_packet(
+        self, packet: torch._ops.OpOverloadPacket
+    ) -> tuple[
+        Callable[[T], T],
+        tuple[tuple[tuple[str, str, str, tuple[str, ...]], ...]],
+    ]:
+        """
+        Custom reducer to pickle OpOverloadPackets.
+
+        A packet's qualified name does not capture schema alias/mutation details
+        for custom ops registered under the same name in another process.
+        """
+        return (
+            _ident,
+            (_op_overload_packet_cache_key(packet),),
+        )
 
     def _reduce_unsupported(self, s: Any) -> NoReturn:
         """
@@ -1408,6 +1522,7 @@ class FxGraphHashDetails:
         # the kernel source code separately
         self.user_defined_triton_source: list[Any] = []
         if gm is not None:
+            op_overload_schema_details = _get_op_overload_schema_details(gm)
             for module in gm.modules():
                 if not isinstance(module, torch.fx.GraphModule):
                     continue
@@ -1444,6 +1559,9 @@ class FxGraphHashDetails:
                     self.user_defined_triton_source.append(
                         (kernel_source, constant_args, configs)
                     )
+
+            if op_overload_schema_details:
+                self.op_overload_schema_details = op_overload_schema_details
 
         no_tensor_inputs = not any(isinstance(x, torch.Tensor) for x in example_inputs)
         # This device index is usually already encoded by the device of the inputs

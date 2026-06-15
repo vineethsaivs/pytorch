@@ -52,7 +52,13 @@ from ..utils import (
     unpack_and_apply_fn,
     unpack_iterable,
 )
-from .base import AsPythonConstantNotImplementedError, ValueMutationNew, VariableTracker
+from .base import (
+    AsPythonConstantNotImplementedError,
+    MutationType,
+    ValueMutationExisting,
+    ValueMutationNew,
+    VariableTracker,
+)
 from .constant import ConstantVariable
 from .functions import UserFunctionVariable
 from .iter import IteratorVariable
@@ -88,6 +94,45 @@ def pylist_checkexact(obj: VariableTracker) -> bool:
 
 def pyslice_check(obj: VariableTracker) -> bool:
     return issubclass(obj.python_type(), slice)
+
+
+def _contains_tensor_variable(value: Any) -> bool:
+    if value is None:
+        return False
+
+    result = False
+
+    def visit(var: VariableTracker) -> None:
+        nonlocal result
+        if var.is_tensor():
+            result = True
+
+    VariableTracker.visit(visit, value)
+    return result
+
+
+def _raise_if_displacing_tensor_from_existing_list(
+    tx: "InstructionTranslatorBase",
+    mutation_type: MutationType | None,
+    value: Any,
+) -> None:
+    if tx.export or tx.is_tracing_resume_prologue:
+        return
+    if isinstance(mutation_type, ValueMutationExisting) and _contains_tensor_variable(
+        value
+    ):
+        unimplemented(
+            gb_type="Tensor displacement from existing Python list",
+            context="replacing or removing a tensor from a pre-existing list",
+            explanation=(
+                "Dynamo replays existing Python list mutations after a compiled "
+                "graph returns. When an assignment or deletion displaces a tensor "
+                "from a pre-existing list slot, replay can keep the old tensor "
+                "entry alive longer than eager execution and increase peak memory, "
+                "so Dynamo graph breaks before the mutation."
+            ),
+            hints=[*graph_break_hints.SUPPORTABLE],
+        )
 
 
 class BaseListVariable(VariableTracker):
@@ -1001,12 +1046,19 @@ class CommonListMethodsVariable(BaseListVariable):
 
             if len(args):
                 idx = args[0].as_python_constant()
-                if idx >= len(self.items):
+                if idx >= len(self.items) or idx < -len(self.items):
                     raise_observed_exception(
                         IndexError, tx, args=["pop index out of range"]
                     )
+                if idx < 0:
+                    idx += len(self.items)
+            else:
+                idx = len(self.items) - 1
+            _raise_if_displacing_tensor_from_existing_list(
+                tx, self.mutation_type, self.items[idx]
+            )
             tx.output.side_effects.mutation(self)
-            return self.items.pop(*[a.as_python_constant() for a in args])
+            return self.items.pop(idx)
         elif name == "clear" and self.is_mutable():
             if args or kwargs:
                 raise_args_mismatch(
@@ -1015,6 +1067,9 @@ class CommonListMethodsVariable(BaseListVariable):
                     "0 args and 0 kwargs",
                     f"{len(args)} args and {len(kwargs)} kwargs",
                 )
+            _raise_if_displacing_tensor_from_existing_list(
+                tx, self.mutation_type, self.items
+            )
             tx.output.side_effects.mutation(self)
             self.items.clear()
             return ConstantVariable.create(None)
@@ -1125,6 +1180,10 @@ class ListVariable(CommonListMethodsVariable):
             new_items = self.items * n
         except (MemoryError, OverflowError) as e:
             raise_observed_exception(type(e), tx, args=list(e.args))
+        if n <= 0:
+            _raise_if_displacing_tensor_from_existing_list(
+                tx, self.mutation_type, self.items
+            )
         tx.output.side_effects.mutation(self)
         self.items[:] = new_items
         return self
@@ -1219,11 +1278,20 @@ class ListVariable(CommonListMethodsVariable):
             if kwargs:
                 raise_args_mismatch(tx, name, "0 kwargs", f"{len(kwargs)} kwargs")
             if len(args) == 0:
+                _raise_if_displacing_tensor_from_existing_list(
+                    tx, self.mutation_type, self.items
+                )
+                tx.output.side_effects.mutation(self)
+                self.items.clear()
                 return ConstantVariable.create(None)
             elif len(args) == 1:
                 (arg,) = args
+                new_items = unpack_iterable(tx, arg)
+                _raise_if_displacing_tensor_from_existing_list(
+                    tx, self.mutation_type, self.items
+                )
                 tx.output.side_effects.mutation(self)
-                self.items[:] = unpack_iterable(tx, arg)
+                self.items[:] = new_items
                 return ConstantVariable.create(None)
 
         return super().call_method(tx, name, args, kwargs)
@@ -1262,6 +1330,9 @@ class ListVariable(CommonListMethodsVariable):
             raise_observed_exception(
                 IndexError, tx, args=["list assignment index out of range"]
             )
+        _raise_if_displacing_tensor_from_existing_list(
+            tx, self.mutation_type, self.items[idx]
+        )
         try:
             if value is None:
                 self.items.__delitem__(idx)
@@ -1297,6 +1368,9 @@ class ListVariable(CommonListMethodsVariable):
                 )
             if value is None:
                 # delete slice
+                _raise_if_displacing_tensor_from_existing_list(
+                    tx, self.mutation_type, self.items[key_as_const]
+                )
                 try:
                     self.items.__delitem__(key_as_const)
                 except ValueError as exc:
@@ -1315,6 +1389,7 @@ class ListVariable(CommonListMethodsVariable):
                     raise_type_error(tx, "must assign iterable to extended slice")
 
                 value_unpack = unpack_iterable(tx, value)
+                old_items = self.items[key_as_const]
                 try:
                     self.items[key_as_const] = value_unpack
                 except ValueError as exc:
@@ -1323,6 +1398,9 @@ class ListVariable(CommonListMethodsVariable):
                         tx,
                         args=list(exc.args),
                     )
+                _raise_if_displacing_tensor_from_existing_list(
+                    tx, self.mutation_type, old_items
+                )
                 tx.output.side_effects.mutation(self)
         else:
             raise_type_error(

@@ -3863,6 +3863,7 @@ class TestFxGraphCacheHashing(TestCase):
             {
                 "trace.provenance_tracking_level": 1,
                 "trace.provenance_tracking_to_timeline": False,
+                "trace.provenance_tracking_fusion": False,
             }
         ):
             details1 = FxGraphHashDetails(None, [], {}, [])
@@ -3872,6 +3873,7 @@ class TestFxGraphCacheHashing(TestCase):
             {
                 "trace.provenance_tracking_level": 1,
                 "trace.provenance_tracking_to_timeline": True,
+                "trace.provenance_tracking_fusion": False,
             }
         ):
             details3 = FxGraphHashDetails(None, [], {}, [])
@@ -3880,9 +3882,19 @@ class TestFxGraphCacheHashing(TestCase):
             {
                 "trace.provenance_tracking_level": 0,
                 "trace.provenance_tracking_to_timeline": True,
+                "trace.provenance_tracking_fusion": False,
             }
         ):
             details4 = FxGraphHashDetails(None, [], {}, [])
+
+        with config.patch(
+            {
+                "trace.provenance_tracking_level": 0,
+                "trace.provenance_tracking_to_timeline": False,
+                "trace.provenance_tracking_fusion": True,
+            }
+        ):
+            details5 = FxGraphHashDetails(None, [], {}, [])
 
         gm = torch.fx.GraphModule({}, torch.fx.Graph())
         pickler = FxGraphCachePickler(gm)
@@ -3898,6 +3910,14 @@ class TestFxGraphCacheHashing(TestCase):
         self.assertNotEqual(
             pickler.dumps(details1),
             pickler.dumps(details4),
+        )
+        self.assertNotEqual(
+            pickler.dumps(details1),
+            pickler.dumps(details5),
+        )
+        self.assertNotEqual(
+            pickler.dumps(details3),
+            pickler.dumps(details5),
         )
 
     def test_provenance_tracking_level_causes_cache_miss(self):

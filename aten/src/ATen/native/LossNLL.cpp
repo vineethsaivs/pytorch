@@ -17,9 +17,12 @@
 #else
 #include <ATen/ops/cross_entropy_loss_native.h>
 #include <ATen/ops/_fused_cross_entropy_loss_2d_forward.h>
+#include <ATen/ops/_fused_cross_entropy_loss_2d_forward_native.h>
+#include <ATen/ops/_fused_cross_entropy_loss_2d_backward_native.h>
 #include <ATen/ops/clamp_min.h>
 #include <ATen/ops/sum.h>
 #include <ATen/ops/empty.h>
+#include <ATen/ops/empty_like.h>
 #include <ATen/ops/log_softmax.h>
 #include <ATen/ops/nll_loss.h>
 #include <ATen/ops/nll_loss2d.h>
@@ -866,6 +869,43 @@ Tensor nll_loss_nd_symint(
     }
   }
   return ret;
+}
+
+
+// Device-agnostic Meta-key implementations for the fused cross-entropy ops.
+// Kept here rather than in the MPS-only CrossEntropy.mm: the Meta dispatch is
+// registered on every build (shape tracing for FakeTensor / torch.compile /
+// export), so its implementations must compile on non-Apple platforms too.
+std::tuple<Tensor, Tensor, Tensor> _fused_cross_entropy_loss_2d_forward_meta(const Tensor& self,
+                                                                             const Tensor& target,
+                                                                             const std::optional<Tensor>& weight_opt,
+                                                                             int64_t ignore_index,
+                                                                             double label_smoothing) {
+  (void)target;
+  (void)weight_opt;
+  (void)ignore_index;
+  (void)label_smoothing;
+  int64_t B = self.dim() == 2 ? self.size(0) : 0;
+  auto loss = at::empty({B}, self.options().dtype(kFloat));
+  auto lse = at::empty({B}, self.options().dtype(kFloat));
+  auto weight_per_row = at::empty({B}, self.options().dtype(kFloat));
+  return {loss, lse, weight_per_row};
+}
+
+Tensor _fused_cross_entropy_loss_2d_backward_meta(const Tensor& grad_loss,
+                                                  const Tensor& self,
+                                                  const Tensor& target,
+                                                  const std::optional<Tensor>& weight_opt,
+                                                  const Tensor& lse,
+                                                  int64_t ignore_index,
+                                                  double label_smoothing) {
+  (void)grad_loss;
+  (void)target;
+  (void)weight_opt;
+  (void)lse;
+  (void)ignore_index;
+  (void)label_smoothing;
+  return at::empty_like(self);
 }
 
 } // namespace at::native

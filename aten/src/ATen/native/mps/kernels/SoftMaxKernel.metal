@@ -213,18 +213,22 @@ kernel void softmax_forward_looped(
       }
       float chunk_max = fmax(fmax(v.x, v.y), fmax(v.z, v.w));
       float new_max = fmax(local_max, chunk_max);
-      local_sum = local_sum * metal::precise::exp(local_max - new_max) +
-          metal::precise::exp(v.x - new_max) +
-          metal::precise::exp(v.y - new_max) +
-          metal::precise::exp(v.z - new_max) +
-          metal::precise::exp(v.w - new_max);
+      local_sum = (new_max > -INFINITY)
+          ? local_sum * metal::precise::exp(local_max - new_max) +
+              metal::precise::exp(v.x - new_max) +
+              metal::precise::exp(v.y - new_max) +
+              metal::precise::exp(v.z - new_max) +
+              metal::precise::exp(v.w - new_max)
+          : 0.0f;
       local_max = new_max;
     } else {
       for (uint i = base; i < min(base + uint(N_READS), axis_size); i++) {
         float val = contiguous ? float(x[i]) : float(x[i * sa]);
         float new_max = fmax(local_max, val);
-        local_sum = local_sum * metal::precise::exp(local_max - new_max) +
-            metal::precise::exp(val - new_max);
+        local_sum = (new_max > -INFINITY)
+            ? local_sum * metal::precise::exp(local_max - new_max) +
+                metal::precise::exp(val - new_max)
+            : 0.0f;
         local_max = new_max;
       }
     }
@@ -343,18 +347,22 @@ kernel void softmax_forward_2pass_reduce(
       }
       float chunk_max = fmax(fmax(v.x, v.y), fmax(v.z, v.w));
       float new_max = fmax(local_max, chunk_max);
-      local_sum = local_sum * metal::precise::exp(local_max - new_max) +
-          metal::precise::exp(v.x - new_max) +
-          metal::precise::exp(v.y - new_max) +
-          metal::precise::exp(v.z - new_max) +
-          metal::precise::exp(v.w - new_max);
+      local_sum = (new_max > -INFINITY)
+          ? local_sum * metal::precise::exp(local_max - new_max) +
+              metal::precise::exp(v.x - new_max) +
+              metal::precise::exp(v.y - new_max) +
+              metal::precise::exp(v.z - new_max) +
+              metal::precise::exp(v.w - new_max)
+          : 0.0f;
       local_max = new_max;
     } else {
       for (uint i = base; i < min(base + uint(N_READS), end); i++) {
         float val = contiguous ? float(x[i]) : float(x[i * sa]);
         float new_max = fmax(local_max, val);
-        local_sum = local_sum * metal::precise::exp(local_max - new_max) +
-            metal::precise::exp(val - new_max);
+        local_sum = (new_max > -INFINITY)
+            ? local_sum * metal::precise::exp(local_max - new_max) +
+                metal::precise::exp(val - new_max)
+            : 0.0f;
         local_max = new_max;
       }
     }
@@ -417,8 +425,10 @@ kernel void softmax_forward_2pass_write(
     float chunk_max = partials[(row_id * num_chunks + i) * 2];
     float chunk_sum = partials[(row_id * num_chunks + i) * 2 + 1];
     float new_max = fmax(global_max, chunk_max);
-    global_sum = global_sum * metal::precise::exp(global_max - new_max) +
-        chunk_sum * metal::precise::exp(chunk_max - new_max);
+    global_sum = (new_max > -INFINITY)
+        ? global_sum * metal::precise::exp(global_max - new_max) +
+            chunk_sum * metal::precise::exp(chunk_max - new_max)
+        : 0.0f;
     global_max = new_max;
   }
   // log_softmax: subtract log(sum_exp); softmax: multiply by 1/sum_exp.

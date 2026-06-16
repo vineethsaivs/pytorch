@@ -195,36 +195,5 @@ Tensor _fused_cross_entropy_loss_2d_backward_mps(const Tensor& grad_loss,
 
 // Meta: shape/dtype inference for fake tensors so torch.compile / export and
 // functorch can trace the fused op without a real MPS device.
-std::tuple<Tensor, Tensor, Tensor> _fused_cross_entropy_loss_2d_forward_meta(const Tensor& self,
-                                                                             const Tensor& target,
-                                                                             const std::optional<Tensor>& weight_opt,
-                                                                             int64_t ignore_index,
-                                                                             double label_smoothing) {
-  (void)target;
-  (void)weight_opt;
-  (void)ignore_index;
-  (void)label_smoothing;
-  int64_t B = self.dim() == 2 ? self.size(0) : 0;
-  auto loss = at::empty({B}, self.options().dtype(kFloat));
-  auto lse = at::empty({B}, self.options().dtype(kFloat));
-  auto weight_per_row = at::empty({B}, self.options().dtype(kFloat));
-  return {loss, lse, weight_per_row};
-}
-
-Tensor _fused_cross_entropy_loss_2d_backward_meta(const Tensor& grad_loss,
-                                                  const Tensor& self,
-                                                  const Tensor& target,
-                                                  const std::optional<Tensor>& weight_opt,
-                                                  const Tensor& lse,
-                                                  int64_t ignore_index,
-                                                  double label_smoothing) {
-  (void)grad_loss;
-  (void)target;
-  (void)weight_opt;
-  (void)lse;
-  (void)ignore_index;
-  (void)label_smoothing;
-  return at::empty_like(self);
-}
 
 } // namespace at::native

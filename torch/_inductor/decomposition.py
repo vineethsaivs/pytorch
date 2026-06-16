@@ -1107,7 +1107,7 @@ def _fused_cross_entropy_loss_2d_forward(
     nll = -w_t * (x_t - lse)
     if label_smoothing > 0.0:
         if weight is not None:
-            wlogit_sum = (x * w).sum(dim=-1)
+            wlogit_sum = (x * weight.float()).sum(dim=-1)
         else:
             wlogit_sum = x.sum(dim=-1)
         smooth = sum_w * lse - wlogit_sum

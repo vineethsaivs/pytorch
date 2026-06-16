@@ -643,7 +643,9 @@ class FSDPParamGroup:
                     # previous backward did not reduce-scatter
                     if fsdp_param.unsharded_accumulated_grad is not None:
                         fsdp_params_with_grad.append(fsdp_param)
-                        unsharded_grads.append(fsdp_param.unsharded_accumulated_grad_data)
+                        unsharded_grads.append(
+                            fsdp_param.unsharded_accumulated_grad_data
+                        )
                         fsdp_param.unsharded_accumulated_grad = None
                     elif fsdp_param.unsharded_param.grad is not None:
                         fsdp_params_with_grad.append(fsdp_param)

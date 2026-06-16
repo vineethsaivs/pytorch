@@ -91,13 +91,50 @@ def _codegen_unwrap_subclass(
 ) -> None:
     """Emit code to recursively unwrap a single subclass input."""
     act_input_paths = act_input_paths or set()
+
+    def emit_plain_tensor_symints(var: str, meta: PlainTensorMeta) -> None:
+        if not include_symints:
+            return
+
+        if any(meta.size_symbol_placeholders):
+            size_var = state.fresh_name("_size")
+            state.emit(f"{size_var} = {var}.size()", indent=indent)
+            for i, is_sym in enumerate(meta.size_symbol_placeholders):
+                if is_sym:
+                    state.emit(f"unwrapped_args.append({size_var}[{i}])", indent=indent)
+
+        if any(meta.stride_symbol_placeholders):
+            stride_var = state.fresh_name("_stride")
+            state.emit(f"{stride_var} = {var}.stride()", indent=indent)
+            for i, is_sym in enumerate(meta.stride_symbol_placeholders):
+                if is_sym:
+                    state.emit(
+                        f"unwrapped_args.append({stride_var}[{i}])", indent=indent
+                    )
+
     for attr, attr_meta in meta.attrs.items():
         attr_expr = _safe_attr_access(var, attr)
         attr_act_input_paths = {
             path[1:] for path in act_input_paths if path and path[0] == attr
         }
         match attr_meta:
-            case PlainTensorMeta() | OpaqueMeta():
+            case PlainTensorMeta():
+                if attr_act_input_paths:
+                    if attr_act_input_paths != {()}:
+                        raise AssertionError(
+                            f"ACT path for {attr} continues past a leaf meta"
+                        )
+                    if act_wait_fn is None:
+                        raise AssertionError("missing ACT wait function")
+                    resolved_var = state.fresh_name("_resolved")
+                    state.emit(
+                        f"{resolved_var} = {act_wait_fn}({attr_expr})",
+                        indent=indent,
+                    )
+                    attr_expr = resolved_var
+                state.emit(f"unwrapped_args.append({attr_expr})", indent=indent)
+                emit_plain_tensor_symints(attr_expr, attr_meta)
+            case OpaqueMeta():
                 if attr_act_input_paths:
                     if attr_act_input_paths != {()}:
                         raise AssertionError(
@@ -176,7 +213,15 @@ def _codegen_wrap_subclass(
 
     for attr, attr_meta in meta.attrs.items():
         match attr_meta:
-            case PlainTensorMeta() | OpaqueMeta():
+            case PlainTensorMeta():
+                attr_expr = state.fresh_name("_out_attr")
+                state.emit(f"{attr_expr} = unwrapped_outs[_out_idx]")
+                state.emit("_out_idx += 1")
+                extra_symints = attr_meta.arg_count - 1
+                if extra_symints:
+                    state.emit("if _has_subclass_symint_outputs:")
+                    state.emit(f"_out_idx += {extra_symints}", indent=2)
+            case OpaqueMeta():
                 attr_expr = state.fresh_name("_out_attr")
                 state.emit(f"{attr_expr} = unwrapped_outs[_out_idx]")
                 state.emit("_out_idx += 1")
@@ -247,7 +292,7 @@ def _count_output_args(
     include_subclass_symints: bool,
 ) -> int:
     if isinstance(meta, PlainTensorMeta):
-        return 1
+        return meta.arg_count if include_subclass_symints else 1
 
     total = 0
     for attr_meta in meta.attrs.values():
@@ -291,9 +336,15 @@ def _emit_output_wrapping(
 
     for meta in out_metas:
         if isinstance(meta, PlainTensorMeta):
-            result_exprs.append(f"unwrapped_outs[{meta.unwrapped_idx}]")
-            num_args_tallied += 1
-            state.emit(f"_out_idx = max(_out_idx, {meta.unwrapped_idx + 1})")
+            out_expr = state.fresh_name("_out_plain")
+            state.emit(f"{out_expr} = unwrapped_outs[_out_idx]")
+            state.emit("_out_idx += 1")
+            extra_symints = meta.arg_count - 1
+            if extra_symints:
+                state.emit("if _has_subclass_symint_outputs:")
+                state.emit(f"_out_idx += {extra_symints}", indent=2)
+            result_exprs.append(out_expr)
+            num_args_tallied += meta.arg_count
         else:
             result_var = _codegen_wrap_subclass(state, meta)
             result_exprs.append(result_var)

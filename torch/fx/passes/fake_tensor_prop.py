@@ -41,6 +41,7 @@ class FakeTensorProp(torch.fx.Interpreter):
     def run_node(self, n: Node) -> Any:
         from torch.fx.experimental.symbolic_shapes import (
             compute_unbacked_bindings,
+            invalidate_unbacked_memos_for_replay,
             rebind_unbacked,
         )
 
@@ -75,6 +76,10 @@ class FakeTensorProp(torch.fx.Interpreter):
             return FakeTensorProp(
                 getattr(self.module, n.args[0].target), mode=self._mode
             ).propagate(*example_inputs)
+
+        if n.meta.get("unbacked_bindings"):
+            args, kwargs = self.fetch_args_kwargs_from_env(n)
+            invalidate_unbacked_memos_for_replay(n, args, kwargs)
 
         result = super().run_node(n)
         rebind_unbacked(self._mode.shape_env, n, result)

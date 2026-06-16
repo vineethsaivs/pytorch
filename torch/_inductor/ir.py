@@ -62,6 +62,7 @@ from torch.fx.experimental.symbolic_shapes import (
     free_unbacked_symbols,
     GuardOnDataDependentSymNode,
     has_free_unbacked_symbols,
+    invalidate_unbacked_memos_for_replay,
     IterateExprs,
     rebind_unbacked,
     resolve_unbacked_bindings,
@@ -7247,6 +7248,7 @@ class ExternKernel(InputsKernel):
             enable_python_dispatcher(),
             _fallback_kernel_symbol_tracking_context(shape_env),
         ):
+            invalidate_unbacked_memos_for_replay(V.current_node, new_args, new_kwargs)
             example_output = kernel(*new_args, **new_kwargs)
 
         unbacked_bindings: dict[sympy.Symbol, pytree.KeyPath] | None = None

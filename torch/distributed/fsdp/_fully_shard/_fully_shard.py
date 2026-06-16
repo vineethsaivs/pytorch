@@ -213,7 +213,9 @@ def fully_shard(
               and a custom :class:`FSDPMeshInfo`. This allows different
               parameters to be sharded across different process groups, enabling
               use cases like Mixture of Experts where expert params use a
-              different mesh than regular params.
+              different mesh than regular params. When using ``spmd_types``,
+              this may also specify the compute mesh used to restore partial
+              parameter annotations.
 
             If sharding on a nonzero dim, we currently require even sharding,
             i.e. the tensor dim size on that dim must be divisible by the FSDP

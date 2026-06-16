@@ -196,6 +196,9 @@ def is_bw() -> bool:
 class ShardPlacementResult:
     placement: Shard | None
     mesh_info: FSDPMeshInfo
+    # Optional compute mesh for restoring partial spmd_types annotations when it
+    # differs from the per-param FSDP storage mesh.
+    spmd_compute_mesh: DeviceMesh | None = None
 
 
 ShardPlacementFnResult = Shard | ShardPlacementResult | None

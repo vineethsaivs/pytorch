@@ -1994,11 +1994,22 @@ class Graph:
             return tensor_node.meta["example_value"], "example_value"
         return None, "val"
 
+    @staticmethod
+    def _has_functorch_wrapper(tensor_val: Any) -> bool:
+        if not isinstance(tensor_val, torch.Tensor):
+            return False
+        from torch._C._functorch import is_batchedtensor, is_gradtrackingtensor
+
+        return is_batchedtensor(tensor_val) or is_gradtrackingtensor(tensor_val)
+
     @compatibility(is_backward_compatible=False)
     def create_size_node(self, tensor_node: Node, dim: int) -> Node:
         """Create an FX node for ``tensor_node.size(dim)``."""
         val, key = self._get_tensor_meta_val(tensor_node)
-        node = self.call_function(torch.ops.aten.sym_size.int, (tensor_node, dim))
+        if self._has_functorch_wrapper(val):
+            node = self.call_method("size", (tensor_node, dim))
+        else:
+            node = self.call_function(torch.ops.aten.sym_size.int, (tensor_node, dim))
         if val is not None:
             node.meta[key] = val.size(dim)
         return node
@@ -2007,7 +2018,10 @@ class Graph:
     def create_stride_node(self, tensor_node: Node, dim: int) -> Node:
         """Create an FX node for ``tensor_node.stride(dim)``."""
         val, key = self._get_tensor_meta_val(tensor_node)
-        node = self.call_function(torch.ops.aten.sym_stride.int, (tensor_node, dim))
+        if self._has_functorch_wrapper(val):
+            node = self.call_method("stride", (tensor_node, dim))
+        else:
+            node = self.call_function(torch.ops.aten.sym_stride.int, (tensor_node, dim))
         if val is not None:
             node.meta[key] = val.stride(dim)
         return node
@@ -2016,9 +2030,12 @@ class Graph:
     def create_storage_offset_node(self, tensor_node: Node) -> Node:
         """Create an FX node for ``tensor_node.storage_offset()``."""
         val, key = self._get_tensor_meta_val(tensor_node)
-        node = self.call_function(
-            torch.ops.aten.sym_storage_offset.default, (tensor_node,)
-        )
+        if self._has_functorch_wrapper(val):
+            node = self.call_method("storage_offset", (tensor_node,))
+        else:
+            node = self.call_function(
+                torch.ops.aten.sym_storage_offset.default, (tensor_node,)
+            )
         if val is not None:
             node.meta[key] = val.storage_offset()
         return node

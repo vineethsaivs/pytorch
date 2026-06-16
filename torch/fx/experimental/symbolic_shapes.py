@@ -56,7 +56,7 @@ import torch.utils._pytree as pytree
 
 # NB: The sym_* functions are used via getattr() and must be imported here.
 from torch import SymBool, SymFloat, SymInt
-from torch._C._functorch import get_unwrapped, is_batchedtensor, is_gradtrackingtensor
+from torch._C._functorch import is_batchedtensor, is_gradtrackingtensor
 from torch._guards import ShapeGuard, SLoc, Source, TracingContext
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_opaque_value
@@ -1327,8 +1327,7 @@ def _free_unbacked_symbols_with_path(
     elif isinstance(a, torch.Tensor) and (
         is_batchedtensor(a) or is_gradtrackingtensor(a)
     ):
-        unwrapped_tensor = get_unwrapped(a)
-        r.update(go(unwrapped_tensor, path))
+        match_tensor(a)
     elif (
         isinstance(a, torch.Tensor)
         and not is_batchedtensor(a)
@@ -1569,6 +1568,9 @@ def _guard_or(a: BoolLikeType, default: bool) -> bool:
     sym_node = a.node
     if sym_node.shape_env is None:
         raise AssertionError("shape_env should not be None")
+    if sym_node.expr.free_symbols & shape_env.do_not_specialize_zero_one_symbols:
+        return default
+
     r = sym_node.shape_env.evaluate_sym_node(
         sym_node, size_oblivious=False, fallback_value=default
     )
@@ -4169,6 +4171,7 @@ class ShapeEnv:
         self.unbacked_alloc_order: dict[sympy.Symbol, int] = {}
 
         self.specialization_stacks: dict[Source, traceback.StackSummary] = {}
+        self.do_not_specialize_zero_one_symbols: set[sympy.Symbol] = set()
 
         # Used by _get_unbacked_replacements / _sub_unbacked_exprs for
         # optimization_hint canonicalization of unbacked expressions.
@@ -4755,12 +4758,17 @@ class ShapeEnv:
         constraint_dims = symbolic_context.constraint_sizes  # type: ignore[attr-defined]
         size: list[sympy.Expr] = []
         for i, val in enumerate(tensor_size):
+            hint = hint_overrides.get(i, val)
             sym = self.create_symbol(
-                hint_overrides.get(i, val),
+                hint,
                 TensorPropertySource(source, TensorProperty.SIZE, i),
                 dynamic_dims[i],
                 constraint_dims[i],
-                do_not_specialize_zero_one=config.backed_size_oblivious,
+                do_not_specialize_zero_one=config.backed_size_oblivious
+                or (
+                    isinstance(constraint_dims[i], StrictMinMaxConstraint)
+                    and hint in (0, 1)
+                ),
                 symbolic_context=symbolic_context,
             )
             if (
@@ -4902,6 +4910,10 @@ class ShapeEnv:
                 foreign_env = sz.node.shape_env  # type: ignore[union-attr]
                 if foreign_env is not None:
                     opt_hint = foreign_env.var_to_hint_override.get(sz.node.expr)  # type: ignore[union-attr]
+                    opt_hint = foreign_env.var_to_hint_override.get(  # type: ignore[union-attr]
+                        sz.node._expr,
+                        opt_hint,
+                    )
                     if opt_hint is not None:
                         hint_overrides[i] = opt_hint
 
@@ -5001,7 +5013,7 @@ class ShapeEnv:
                 and hint_overrides
                 and i in hint_overrides
             ):
-                self.var_to_hint_override[sym_sizes[-1].node.expr] = hint_overrides[i]
+                self.var_to_hint_override[sym_sizes[-1].node._expr] = hint_overrides[i]
 
         sym_strides = []
         for i, stride_expr in enumerate(new_stride_exprs):
@@ -5127,7 +5139,7 @@ class ShapeEnv:
 
         for i, sym in enumerate(sym_sizes):
             if isinstance(sym, torch.SymInt) and i in hint_overrides:
-                self.var_to_hint_override[sym.node.expr] = hint_overrides[i]
+                self.var_to_hint_override[sym.node._expr] = hint_overrides[i]
 
         sym_stride = []
         for i, stride_expr in enumerate(stride):
@@ -5670,6 +5682,8 @@ class ShapeEnv:
                 sympy_expr = make_symbol(
                     SymT.SIZE, symbol_id, positive=positive, integer=True
                 )
+                if do_not_specialize_zero_one and val in (0, 1):
+                    self.do_not_specialize_zero_one_symbols.add(sympy_expr)
             else:
                 sympy_expr = make_symbol(
                     SymT.FLOAT, symbol_id, positive=positive, real=True
@@ -6083,12 +6097,25 @@ class ShapeEnv:
             for i, src in enumerate(sources):
                 source_index[src.name] = i
 
-            def get_expression(tensor_dim_src: Source) -> sympy.Expr:
+            example_value_replacements = {
+                k: sympy.sympify(v) for k, v in self.var_to_hint_override.items()
+            }
+
+            def replace_with_example_values(expr: sympy.Basic) -> sympy.Basic:
+                return expr.xreplace(self.backed_var_to_val).xreplace(
+                    example_value_replacements
+                )
+
+            def get_expression(
+                tensor_dim_src: Source, *, ignore_replacements: bool = False
+            ) -> sympy.Expr:
                 fake = placeholders[source_index[tensor_dim_src.base.name]]  # type: ignore[attr-defined]
                 if tensor_dim_src.idx is None:  # type: ignore[attr-defined]
                     raise AssertionError("tensor_dim_src.idx must not be None")
                 symint = fake.shape[tensor_dim_src.idx]  # type: ignore[attr-defined]
                 if isinstance(symint, torch.SymInt):
+                    if ignore_replacements:
+                        return symint.node._expr
                     return symint.node.expr
                 else:
                     if type(symint) is not int:
@@ -6100,13 +6127,32 @@ class ShapeEnv:
                 # Check whether given input shape values satisfy a specified equation s = s'.
                 # - Raise when the equation was violated by the given input shape values.
                 # - Otherwise issue a guard to constrain them.
-                concrete_val = self.evaluate_expr(sympy.Eq(expr1, expr2))
+                eq = sympy.Eq(expr1, expr2)
+                example_expr1 = get_expression(src1, ignore_replacements=True)
+                example_expr2 = get_expression(src2, ignore_replacements=True)
+                example_eq = sympy.Eq(example_expr1, example_expr2)
+                concrete_val = self._maybe_evaluate_static(
+                    replace_with_example_values(example_eq),
+                    compute_hint=True,
+                )
+                evaluated_eq = False
+                if concrete_val is None:
+                    concrete_val = self.evaluate_expr(eq)
+                    evaluated_eq = True
                 if not concrete_val:
                     raise ConstraintViolationError(
-                        f"{src1.name} = {expr1 if isinstance(expr1, int) else expr1.xreplace(self.backed_var_to_val)}"
+                        f"{src1.name} = {replace_with_example_values(example_expr1)}"
                         " is not equal to "
-                        f"{src2.name} = {expr2 if isinstance(expr2, int) else expr2.xreplace(self.backed_var_to_val)}"
+                        f"{src2.name} = {replace_with_example_values(example_expr2)}"
                     )
+                if not evaluated_eq:
+                    concrete_val = self.evaluate_expr(eq)
+                    if not concrete_val:
+                        raise ConstraintViolationError(
+                            f"{src1.name} = {replace_with_example_values(example_expr1)}"
+                            " is not equal to "
+                            f"{src2.name} = {replace_with_example_values(example_expr2)}"
+                        )
 
             for srcEq, root, fn in equalities_inputs.derived_equalities:
                 expr1 = get_expression(srcEq)
@@ -6121,13 +6167,45 @@ class ShapeEnv:
                 # Check whether given input shape values satisfy a specified equation s = fn(s').
                 # - Raise when the equation was violated by the given input shape values.
                 # - Otherwise issue a guard to constrain them.
-                concrete_val = self.evaluate_expr(sympy.Eq(expr1, expr2_))
+                eq = sympy.Eq(expr1, expr2_)
+                concrete_val = self._maybe_evaluate_static(
+                    replace_with_example_values(eq),
+                    compute_hint=True,
+                )
+                if concrete_val is not None and not bool(concrete_val):
+                    raise ConstraintViolationError(
+                        f"Expected input {srcEq.name} to be equal to "
+                        f"{fn(sympy.Symbol(debug_name))}, "
+                        f"where {debug_name} = {replace_with_example_values(expr2)}, "
+                        f"but got {replace_with_example_values(expr1)}"
+                    )
+                if (
+                    isinstance(root, sympy.Symbol)
+                    and not (eq is sympy.S.true or eq is True)
+                    and concrete_val is not None
+                    and expr1.free_symbols
+                    and expr1.free_symbols <= expr2_.free_symbols
+                ):
+                    raise ConstraintViolationError(
+                        f"Expected input {srcEq.name} to be equal to "
+                        f"{fn(sympy.Symbol(debug_name))}, but this equality "
+                        f"would specialize {debug_name} to the example value"
+                    )
+                try:
+                    concrete_val = self.evaluate_expr(eq)
+                except GuardOnDataDependentSymNode:
+                    if concrete_val is None or bool(concrete_val):
+                        concrete_val = self.guard_or_defer_runtime_assert(
+                            eq,
+                            f"Expected input {srcEq.name} to be equal to "
+                            f"{fn(sympy.Symbol(debug_name))}",
+                        )
                 if not concrete_val:
                     raise ConstraintViolationError(
                         f"Expected input {srcEq.name} to be equal to "
                         f"{fn(sympy.Symbol(debug_name))}, "
-                        f"where {debug_name} = {expr2.xreplace(self.backed_var_to_val)}, "
-                        f"but got {expr1.xreplace(self.backed_var_to_val)}"
+                        f"where {debug_name} = {replace_with_example_values(expr2)}, "
+                        f"but got {replace_with_example_values(expr1)}"
                     )
 
             for phantom_symbol in equalities_inputs.phantom_symbols:

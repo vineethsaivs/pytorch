@@ -819,6 +819,26 @@ class DistMathOpsTest(DTensorTestBase):
             self.assertEqual(so.full_tensor(), o)
 
     @with_comms
+    def test_foreach_max_sharded(self):
+        device_mesh = self.build_device_mesh()
+
+        torch.manual_seed(42)
+        tensors = [
+            torch.randn(12, 8, device=self.device_type),
+            torch.randn(8, 8, device=self.device_type),
+        ]
+        sharded_tensors = [
+            distribute_tensor(tensor, device_mesh, [Shard(0)]) for tensor in tensors
+        ]
+
+        expected = torch._foreach_max(tensors)
+        actual = torch._foreach_max(sharded_tensors)
+
+        for expected_max, actual_max in zip(expected, actual):
+            self.assertEqual(actual_max.placements, (Partial("max"),))
+            self.assertEqual(actual_max.full_tensor(), expected_max)
+
+    @with_comms
     def test_foreach_norm_partial(self):
         device_mesh = self.build_device_mesh()
 

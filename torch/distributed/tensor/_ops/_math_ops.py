@@ -26,7 +26,6 @@ from torch.distributed.tensor._ops.utils import (
     is_tensor_evenly_shardable_on_dim,
     normalize_dim,
     normalize_dims,
-    register_op_strategy,
 )
 from torch.distributed.tensor._utils import (
     compute_local_shape_and_global_offset,
@@ -146,10 +145,8 @@ def _infer_reduce_dims_map(
     new_dim_count = 0
     for input_dim in range(input_ndim):
         if input_dim in reduction_dims and not keep_dim:
-            # if input dim in reduction dims, mark it as -1
             reduction_dims_map.append(-1)
         else:
-            # otherwise mark it as the new dim
             reduction_dims_map.append(new_dim_count)
             new_dim_count += 1
 
@@ -162,18 +159,20 @@ def _replicate_dims_start_at(
     new_placements: list[Placement] = []
     for p in placements:
         if p.is_partial() or (_is_shard_like(p) and p.dim >= start_dim):
-            new_placements.append(Replicate())  # make it replicate
+            new_placements.append(Replicate())
         else:
-            new_placements.append(p)  # keep the placement
+            new_placements.append(p)
     return tuple(new_placements)
 
 
-# return new_placements which align with placements but skip the skipped_dim
-# Precondition: no shard-like placement on skipped_dim (callers must
-# replicate it first via replicate_reduction_dims).
 def _skip_dim(
     placements: tuple[Placement, ...], skipped_dim: int
 ) -> tuple[Placement, ...]:
+    """Return placements aligned with the input but with skipped_dim removed.
+
+    Precondition: callers must first replicate any shard-like placement on
+    skipped_dim, typically via replicate_reduction_dims().
+    """
     new_placements: list[Placement] = []
     for p in placements:
         if isinstance(p, _StridedShard) and p.dim >= skipped_dim:
@@ -188,7 +187,6 @@ def _skip_dim(
 def replicate_reduction_dims(
     placements: tuple[Placement, ...], reduction_dims: list[int]
 ) -> tuple[Placement, ...]:
-    # replicate the reduction dims if not reduction_linear
     new_placements: list[Placement] = []
 
     for p in placements:
@@ -208,9 +206,7 @@ def map_placements_after_reduction(
     reduction_dims_map: list[int],
     reduction_op: ReductionOpType,
 ) -> tuple[Placement, ...]:
-    """
-    Map each placement based on the output shape after reduction.
-    """
+    """Map each placement based on the output shape after reduction."""
     new_placements: list[Placement] = []
     for placement in placements:
         if isinstance(placement, (Replicate, Partial)):
@@ -223,8 +219,8 @@ def map_placements_after_reduction(
             shard_dim = placement.dim
             new_shard_dim = reduction_dims_map[shard_dim]
             if new_shard_dim == -1 or shard_dim in reduction_dims:
-                # if new_shard_dim collapsed or its in the reduction dims
-                # (i.e. for the case where keepdims=True), we generate partial
+                # The shard dim was reduced away, or was kept as a reduced dim
+                # for keepdim=True, so the output placement becomes partial.
                 new_placements.append(get_placement_from_reduction_op(reduction_op))
             else:
                 if isinstance(placement, _StridedShard):
@@ -254,11 +250,12 @@ def common_reduction_strategy(
     reduction_linear: bool = True,
     reduction_op: ReductionOpType = "sum",
 ) -> OpStrategy:
-    """
-    reduction_linear means that the reduction `f` follows this rule:
+    """Build OpStrategy for reductions.
+
+    reduction_linear means that the reduction f follows this rule:
         f([f(a), f(b)]) = f([a, b])
 
-    reduction linear should be super set of linearity.
+    reduction linearity is broader than ordinary linearity.
     """
     reduction_strategy = OpStrategy([])
 
@@ -294,6 +291,7 @@ def common_reduction_strategy(
         out_placements = map_placements_after_reduction(
             input_spec.placements, reduce_dims, reduce_dims_map, reduction_op
         )
+        redistribute_cost = [generate_redistribute_costs(input_strategy, input_spec)]
         reduction_strategy.strategies.append(
             OpSpec(
                 output_specs=DTensorSpec(
@@ -301,9 +299,7 @@ def common_reduction_strategy(
                     placements=out_placements,
                 ),
                 input_specs=(input_spec,),
-                redistribute_cost=[
-                    generate_redistribute_costs(input_strategy, input_spec)
-                ],
+                redistribute_cost=redistribute_cost,
             )
         )
 
@@ -355,7 +351,7 @@ def _reduction_single_dim_strategy(
             strategies.append([_ShardingPlaceholder(out_d), _ShardingPlaceholder(d)])
 
     # Partial propagation: Partial(reduction_op) input -> Partial(reduction_op) output.
-    # Skip for NormReduction: the old OpStrategy path did not propagate
+    # Skip for NormReduction: the legacy strategy path did not propagate
     # _NormPartial through, so keep that behavior.
     if reduction_linear and not isinstance(reduction_op, NormReduction):
         partial_placement = get_placement_from_reduction_op(reduction_op)
@@ -396,6 +392,15 @@ LINEAR_REDUCTION_OP_MAP = {
     aten.amin.out: "min",
     prims.amin.default: "min",
     aten.nansum.default: "sum",
+}
+
+FOREACH_LINEAR_REDUCTION_OP_MAP = {
+    aten._foreach_max.default: "max",
+}
+
+LINEAR_REDUCTION_OP_TO_REDUCE_OP = {
+    **LINEAR_REDUCTION_OP_MAP,
+    **FOREACH_LINEAR_REDUCTION_OP_MAP,
 }
 
 # all/any are NOT linear reductions: validation showed S(reduction_dim)->P(...)
@@ -447,9 +452,7 @@ def linear_reduction_single_dim_strategy(
         dims = _infer_reduction_dims(args_schema[1], ndim)
 
     keep_dim = len(args_schema) > 2 and bool(args_schema[2])
-    reduction_op = (
-        "max" if op == aten._foreach_max.default else LINEAR_REDUCTION_OP_MAP[op]
-    )
+    reduction_op = LINEAR_REDUCTION_OP_TO_REDUCE_OP[op]
     return _reduction_single_dim_strategy(
         args_schema,
         reduction_dims=dims,
@@ -460,7 +463,7 @@ def linear_reduction_single_dim_strategy(
 
 
 register_single_dim_strategy(
-    [aten._foreach_max.default],
+    list(FOREACH_LINEAR_REDUCTION_OP_MAP.keys()),
     schema_info=RuntimeSchemaInfo(1, needs_pytree=True),
     allow_uneven_sharding=True,
     allow_unbacked_sharding=False,
@@ -487,6 +490,14 @@ def _mean_full_mesh_strategy_filter(
     input_specs: list[DTensorSpec],
     output_specs: DTensorSpec | tuple[DTensorSpec | None, ...],
 ) -> bool:
+    """Reject mean strategies that would average uneven local means.
+
+    mean uses Partial("avg") for shards on reduction dims. That is only correct
+    when every rank contributes the same number of elements; otherwise averaging
+    the per-rank means weights small and large shards equally. The single-dim
+    rule cannot know the final product of mesh dims sharding a tensor dim, so
+    this filter checks the materialized full-mesh input spec.
+    """
     input_spec = input_specs[0]
     dims = None
     if len(op_schema.args_schema) > 1:
@@ -618,6 +629,67 @@ def max_min_dim_single_dim_strategy(
     return _shard_non_reduction_dim(args_schema, dim, keep_dim, n_outputs=2)
 
 
+def _argmax_argmin_reduction_dims(
+    args_schema: tuple[Any, ...], kwargs_schema: dict[str, Any], ndim: int
+) -> list[int]:
+    if "dim" in kwargs_schema:
+        dims_arg = kwargs_schema["dim"]
+    elif len(args_schema) > 1:
+        dims_arg = args_schema[1]
+    else:
+        dims_arg = None
+    dims = _infer_reduction_dims(dims_arg, ndim)
+    return list(range(ndim)) if dims is None else dims
+
+
+def _argmax_argmin_full_mesh_strategy_filter(
+    _mesh: DeviceMesh,
+    op_schema: OpSchema,
+    input_specs: list[DTensorSpec],
+    _output_specs: DTensorSpec | tuple[DTensorSpec | None, ...],
+) -> bool:
+    """
+    Filter strategies to match the custom nonlinear-redux handler.
+
+    argminmax_handler computes from the runtime DTensor placements instead of
+    applying the normal redistribute_schema. It only materializes Partial inputs
+    and reduction-dim shards to Replicate, so sharding propagation must not pick
+    a target input spec that would require retargeting those placements to a
+    non-reduction shard.
+    """
+    args_schema = op_schema.args_schema
+    input_strategy = args_schema[0]
+    if not isinstance(input_strategy, OpStrategy):
+        raise AssertionError(f"Expected OpStrategy, got {type(input_strategy)}")
+
+    input_meta = input_strategy.tensor_meta
+    if input_meta is None:
+        raise AssertionError("Expected input tensor meta")
+
+    reduce_dims = _argmax_argmin_reduction_dims(
+        args_schema, op_schema.kwargs_schema, len(input_meta.shape)
+    )
+
+    input_spec = input_strategy.strategies[0].output_spec
+    target_input_spec = input_specs[0]
+    for input_placement, target_placement in zip(
+        input_spec.placements, target_input_spec.placements
+    ):
+        if input_placement.is_partial() or (
+            _is_shard_like(input_placement) and input_placement.dim in reduce_dims
+        ):
+            if not target_placement.is_replicate():
+                return False
+    return True
+
+
+@register_single_dim_strategy(
+    list(ARGMAX_ARGMIN_OPS.keys()),
+    schema_info=RuntimeSchemaInfo(1, ["dim", "keepdim"]),
+    allow_uneven_sharding=True,
+    allow_unbacked_sharding=False,
+    full_mesh_strategy_filter=_argmax_argmin_full_mesh_strategy_filter,
+)
 def argmax_argmin_single_dim_strategy(
     op: torch._ops.OpOverload,
     args_schema: tuple[Any, ...],
@@ -629,11 +701,12 @@ def argmax_argmin_single_dim_strategy(
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
     ndim = len(input_meta.shape)
 
-    dims = None
-    if len(args_schema) > 1:
-        dims = _infer_reduction_dims(args_schema[1], ndim)
-    reduce_dims = list(range(ndim)) if dims is None else dims
-    keep_dim = len(args_schema) > 2 and bool(args_schema[2])
+    reduce_dims = _argmax_argmin_reduction_dims(args_schema, kwargs_schema, ndim)
+    keep_dim = (
+        bool(kwargs_schema["keepdim"])
+        if "keepdim" in kwargs_schema
+        else len(args_schema) > 2 and bool(args_schema[2])
+    )
 
     if len(reduce_dims) == ndim:
         return []
@@ -647,29 +720,6 @@ def argmax_argmin_single_dim_strategy(
             out_d = d - sum(1 for rd in reduce_dims if rd < d)
         strategies.append([_ShardingPlaceholder(out_d), _ShardingPlaceholder(d)])
     return strategies
-
-
-@register_op_strategy(list(ARGMAX_ARGMIN_OPS.keys()), schema_info=RuntimeSchemaInfo(1))
-def argmax_argmin_strategy(op_schema: OpSchema) -> OpStrategy:
-    args_schema = op_schema.args_schema
-    input_strategy = args_schema[0]
-    if not isinstance(input_strategy, OpStrategy):
-        raise AssertionError(f"Expected OpStrategy, got {type(input_strategy)}")
-
-    dims = None
-    if len(args_schema) > 1:
-        dims = _infer_reduction_dims(args_schema[1], input_strategy.ndim)
-
-    reduce_dims = list(range(input_strategy.ndim)) if dims is None else dims
-    keep_dim = len(args_schema) > 2 and bool(args_schema[2])
-    reduction_op = ARGMAX_ARGMIN_OPS[op_schema.op]
-    return common_reduction_strategy(
-        input_strategy,
-        reduce_dims,
-        keep_dim=keep_dim,
-        reduction_linear=False,
-        reduction_op=reduction_op,
-    )
 
 
 def _shard_except_dim_strategy(
@@ -1111,260 +1161,203 @@ def softmax_backward_single_dim_strategy(
     )
 
 
-@register_op_strategy(
+def _nll_loss_forward_full_mesh_strategy_filter(
+    mesh: DeviceMesh,
+    op_schema: OpSchema,
+    input_specs: list[DTensorSpec],
+    output_specs: DTensorSpec | tuple[DTensorSpec | None, ...],
+) -> bool:
+    if not isinstance(output_specs, tuple):
+        raise AssertionError(f"Expected tuple output specs, got {type(output_specs)}")
+    output_spec = output_specs[0]
+    if output_spec is None:
+        raise AssertionError("Expected nll_loss output spec")
+
+    if any(
+        isinstance(p, Partial) and p.reduce_op == "avg" for p in output_spec.placements
+    ):
+        # For reduction="mean", nll_loss averages the per-target losses. A
+        # Partial("avg") output is only correct when each rank contributes the
+        # same number of target elements; otherwise averaging per-rank means is
+        # biased. Reject uneven target sharding so the strategy falls back to
+        # replication before computing the mean.
+        target_spec = input_specs[1]
+        return is_tensor_evenly_shardable(target_spec.shape, target_spec)
+    return True
+
+
+@register_single_dim_strategy(
     [aten.nll_loss_forward.default, aten.nll_loss2d_forward.default],
     schema_info=RuntimeSchemaInfo(3),
+    full_mesh_strategy_filter=_nll_loss_forward_full_mesh_strategy_filter,
 )
-def nll_loss_forward_strategy(op_schema: OpSchema) -> OpStrategy:
-    mesh = op_schema.get_mesh_from_args()
-
-    if not len(op_schema.args_schema) == 5:
-        raise AssertionError(f"Expected 5 args, got {len(op_schema.args_schema)}")
+def nll_loss_forward_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    if len(args_schema) != 5:
+        raise AssertionError(f"Expected 5 args, got {len(args_schema)}")
 
     (
-        input_strategy,
-        target_strategy,
-        weight_strategy,
+        input_meta,
+        target_meta,
+        weight_meta,
         reduction,
         _,
-    ) = op_schema.args_schema
-    input_strategy = cast(OpStrategy, input_strategy)
-    target_strategy = cast(OpStrategy, target_strategy)
+    ) = args_schema
+    if not isinstance(input_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
+    if not isinstance(target_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(target_meta)}")
+    if weight_meta is not None and not isinstance(weight_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(weight_meta)}")
     reduction = cast(int, reduction)
 
-    input_shape = input_strategy.shape
+    input_shape = input_meta.shape
     channel_dim = 1 if len(input_shape) >= 2 else 0
-
-    output_strategy = OpStrategy([])
-    for idx, input_placement_strategy in enumerate(input_strategy.strategies):
-        op_args_target_specs = []
-        redistribute_costs = []
-
-        # make sure input is replicated along the channel dim
-        input_src_spec = input_placement_strategy.output_spec
-        input_expected_spec = DTensorSpec(
-            mesh=mesh,
-            placements=replicate_reduction_dims(
-                input_src_spec.placements, [channel_dim]
-            ),
-            tensor_meta=input_src_spec.tensor_meta,
-        )
-        op_args_target_specs.append(input_expected_spec)
-        redistribute_costs.append(
-            generate_redistribute_costs(input_strategy, input_expected_spec)
-        )
-
-        # target doesn't have channel dim, and it follows input on other dims
-        target_src_spec = target_strategy.strategies[idx].output_spec
-        target_expected_spec = DTensorSpec(
-            mesh=mesh,
-            placements=_skip_dim(input_expected_spec.placements, channel_dim),
-            tensor_meta=target_src_spec.tensor_meta,
-        )
-        op_args_target_specs.append(target_expected_spec)
-        redistribute_costs.append(
-            generate_redistribute_costs(target_strategy, target_expected_spec)
-        )
-
-        # weight tensor, if given, has to be a Tensor of size input_shape[channel_dim]
-        # make sure it is replicated
-        if weight_strategy is not None:
-            if not isinstance(weight_strategy, OpStrategy):
-                raise AssertionError(
-                    f"Expected OpStrategy, got {type(weight_strategy)}"
-                )
-            weight_src_spec = weight_strategy.strategies[idx].output_spec
-            weight_expected_spec = DTensorSpec(
-                mesh=mesh,
-                placements=_replicate_dims_start_at(weight_src_spec.placements),
-                tensor_meta=weight_src_spec.tensor_meta,
-            )
-            op_args_target_specs.append(weight_expected_spec)
-            redistribute_costs.append(
-                generate_redistribute_costs(weight_strategy, weight_expected_spec)
-            )
-
+    strategies: list[list[Placement | _ShardingPlaceholder]] = []
+    # weight, if given, has size input_shape[channel_dim], so replicate it.
+    weight_placement = [Replicate()] if weight_meta is not None else []
+    for input_dim in range(len(input_shape)):
+        # Input must be replicated along the channel dim.
+        if input_dim == channel_dim:
+            continue
+        # Target has no channel dim and follows input on the other dims.
+        target_dim = input_dim if input_dim < channel_dim else input_dim - 1
+        input_shard = _ShardingPlaceholder(input_dim)
+        target_shard = _ShardingPlaceholder(target_dim)
         if reduction == Reduction.NONE.value:
-            output_expected_spec = target_expected_spec
-            total_weight_expected_spec = DTensorSpec(
-                mesh=mesh, placements=tuple([Replicate()] * mesh.ndim)
+            # With reduction="none", output follows target and total_weight is
+            # a replicated scalar.
+            strategies.append(
+                [
+                    target_shard,
+                    Replicate(),
+                    input_shard,
+                    target_shard,
+                    *weight_placement,
+                ]
             )
         else:
-            if reduction == Reduction.MEAN.value:
-                reduction_op = "avg"
-                if not is_tensor_evenly_shardable(
-                    target_expected_spec.shape, target_expected_spec
-                ):
-                    raise ValueError(
-                        "The intermediate results of nll_loss cannot be evenly sharded, \
-                        resulting in biased mean result."
-                    )
-            else:  # reduction == Reduction.SUM.value:
-                reduction_op = "sum"
-            reduce_dims = list(range(target_expected_spec.ndim))
-            reduce_dims_map = _infer_reduce_dims_map(
-                reduce_dims, target_expected_spec.ndim, keep_dim=False
-            )
-            out_placements = map_placements_after_reduction(
-                target_expected_spec.placements,
-                reduce_dims,
-                reduce_dims_map,
-                reduction_op,
-            )
-            output_expected_spec = DTensorSpec(
-                mesh=mesh,
-                placements=out_placements,
+            reduction_op = "avg" if reduction == Reduction.MEAN.value else "sum"
+            # The output reduces across all target dims. Whether reduction is
+            # sum or mean, total_weight is summed across ranks if not replicated.
+            strategies.append(
+                [
+                    Partial(reduction_op),
+                    Partial("sum"),
+                    input_shard,
+                    target_shard,
+                    *weight_placement,
+                ]
             )
 
-            # whether reduction is sum or mean, the total weight has to be summed up if not replicated
-            total_weight_placements = map_placements_after_reduction(
-                target_expected_spec.placements,
-                reduce_dims,
-                reduce_dims_map,
-                "sum",
-            )
-            total_weight_expected_spec = DTensorSpec(
-                mesh=mesh,
-                placements=total_weight_placements,
-            )
-
-        output_strategy.strategies.append(
-            OpSpec(
-                output_specs=(output_expected_spec, total_weight_expected_spec),
-                input_specs=op_args_target_specs,
-                redistribute_cost=redistribute_costs,
-            )
-        )
-
-    return output_strategy
+    return strategies
 
 
-@register_op_strategy(
+@register_single_dim_strategy(
     [aten.nll_loss_backward.default, aten.nll_loss2d_backward.default],
     schema_info=RuntimeSchemaInfo(4),
 )
-def nll_loss_backward_strategy(op_schema: OpSchema) -> OpStrategy:
-    # backward op does not need to validate the mesh since forward op has already done it
-    mesh = op_schema.get_mesh_from_args(validate=False)
-
-    if not len(op_schema.args_schema) == 7:
-        raise AssertionError(f"Expected 7 args, got {len(op_schema.args_schema)}")
+def nll_loss_backward_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    if len(args_schema) != 7:
+        raise AssertionError(f"Expected 7 args, got {len(args_schema)}")
     (
-        grad_out_strategy,
-        input_strategy,
-        target_strategy,
-        weight_strategy,
+        grad_out_meta,
+        input_meta,
+        target_meta,
+        weight_meta,
         reduction,
         _,
-        total_weight_strategy,
-    ) = op_schema.args_schema
-    grad_out_strategy = cast(OpStrategy, grad_out_strategy)
-    input_strategy = cast(OpStrategy, input_strategy)
-    target_strategy = cast(OpStrategy, target_strategy)
+        total_weight_meta,
+    ) = args_schema
+    if not isinstance(grad_out_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(grad_out_meta)}")
+    if not isinstance(input_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
+    if not isinstance(target_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(target_meta)}")
+    if weight_meta is not None and not isinstance(weight_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(weight_meta)}")
+    if not isinstance(total_weight_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(total_weight_meta)}")
     reduction = cast(int, reduction)
-    total_weight_strategy = cast(OpStrategy, total_weight_strategy)
 
-    input_shape = input_strategy.shape
+    input_shape = input_meta.shape
     channel_dim = 1 if len(input_shape) >= 2 else 0
+    strategies: list[list[Placement | _ShardingPlaceholder]] = []
+    # weight, if given, has size input_shape[channel_dim], so replicate it.
+    weight_placement = [Replicate()] if weight_meta is not None else []
 
-    grad_in_strategy = OpStrategy([])
-    for idx, input_placement_strategy in enumerate(input_strategy.strategies):
-        op_args_target_specs = []
-        redistribute_costs = []
+    for input_dim in range(len(input_shape)):
+        # Input must be replicated along the channel dim.
+        if input_dim == channel_dim:
+            continue
+        # Target has no channel dim and follows input on the other dims.
+        target_dim = input_dim if input_dim < channel_dim else input_dim - 1
+        input_shard = _ShardingPlaceholder(input_dim)
+        target_shard = _ShardingPlaceholder(target_dim)
 
-        # make sure input is replicated along the channel dim
-        input_src_spec = input_placement_strategy.output_spec
-        input_expected_spec = DTensorSpec(
-            mesh=mesh,
-            placements=replicate_reduction_dims(
-                input_src_spec.placements, [channel_dim]
-            ),
-            tensor_meta=input_src_spec.tensor_meta,
-        )
-        op_args_target_specs.append(input_expected_spec)
-        redistribute_costs.append(
-            generate_redistribute_costs(input_strategy, input_expected_spec)
-        )
-
-        # target doesn't have channel dim, and it follows input on other dims
-        target_src_spec = target_strategy.strategies[idx].output_spec
-        target_expected_spec = DTensorSpec(
-            mesh=mesh,
-            placements=_skip_dim(input_expected_spec.placements, channel_dim),
-            tensor_meta=target_src_spec.tensor_meta,
-        )
-        op_args_target_specs.append(target_expected_spec)
-        redistribute_costs.append(
-            generate_redistribute_costs(target_strategy, target_expected_spec)
-        )
-
-        # grad_out follows target if there is no reduction;
-        # otherwise, it should be a replicated scalar.
-        grad_out_src_spec = grad_out_strategy.strategies[idx].output_spec
         if reduction == Reduction.NONE.value:
-            grad_out_expected_spec = target_expected_spec
-        else:
-            grad_out_expected_spec = DTensorSpec(
-                mesh=mesh,
-                placements=_replicate_dims_start_at(grad_out_src_spec.placements),
-                tensor_meta=grad_out_src_spec.tensor_meta,
+            # grad_out follows target when there is no reduction; total_weight
+            # is unused by the kernel, so keep it replicated here.
+            strategies.append(
+                [
+                    input_shard,
+                    target_shard,
+                    input_shard,
+                    target_shard,
+                    *weight_placement,
+                    Replicate(),
+                ]
             )
-        op_args_target_specs.insert(0, grad_out_expected_spec)
-        redistribute_costs.insert(
-            0, generate_redistribute_costs(grad_out_strategy, grad_out_expected_spec)
-        )
+        else:
+            # grad_out is a replicated scalar for reduced outputs.
+            total_weight_placements: list[Placement] = [Replicate()]
+            if reduction != Reduction.MEAN.value:
+                # total_weight is only used for reduction="mean". For sum it is
+                # unused, so a partial placement is also valid and avoids
+                # unnecessary redistribution.
+                total_weight_placements.append(Partial("sum"))
 
-        # weight tensor, if given, has to be a Tensor of size input_shape[channel_dim]
-        # make sure it is replicated
-        if weight_strategy is not None:
-            if not isinstance(weight_strategy, OpStrategy):
-                raise AssertionError(
-                    f"Expected OpStrategy, got {type(weight_strategy)}"
+            for total_weight_placement in total_weight_placements:
+                strategies.append(
+                    [
+                        input_shard,
+                        Replicate(),
+                        input_shard,
+                        target_shard,
+                        *weight_placement,
+                        total_weight_placement,
+                    ]
                 )
-            weight_src_spec = weight_strategy.strategies[idx].output_spec
-            weight_expected_spec = DTensorSpec(
-                mesh=mesh,
-                placements=_replicate_dims_start_at(weight_src_spec.placements),
-                tensor_meta=weight_src_spec.tensor_meta,
-            )
-            op_args_target_specs.append(weight_expected_spec)
-            redistribute_costs.append(
-                generate_redistribute_costs(weight_strategy, weight_expected_spec)
-            )
 
-        # total_weight is only used by the backward kernel for reduction='mean'.
-        # For reduction='sum' or 'none', it is unused, so no redistribution needed.
-        total_weight_src_spec = total_weight_strategy.strategies[idx].output_spec
-        if reduction == Reduction.MEAN.value:
-            total_weight_expected_spec = DTensorSpec(
-                mesh=mesh,
-                placements=_replicate_dims_start_at(total_weight_src_spec.placements),
-                tensor_meta=total_weight_src_spec.tensor_meta,
-            )
-        else:
-            total_weight_expected_spec = total_weight_src_spec
-        op_args_target_specs.append(total_weight_expected_spec)
-        redistribute_costs.append(
-            generate_redistribute_costs(
-                total_weight_strategy, total_weight_expected_spec
-            )
+    if reduction != Reduction.MEAN.value:
+        # When total_weight is unused, also allow a replicated input/output
+        # strategy that preserves Partial("sum") total_weight.
+        strategies.append(
+            [
+                Replicate(),
+                Replicate(),
+                Replicate(),
+                Replicate(),
+                *weight_placement,
+                Partial("sum"),
+            ]
         )
 
-        grad_in_expected_spec = input_expected_spec
-        grad_in_strategy.strategies.append(
-            OpSpec(
-                output_specs=grad_in_expected_spec,
-                input_specs=op_args_target_specs,
-                redistribute_cost=redistribute_costs,
-            )
-        )
-
-    return grad_in_strategy
+    return strategies
 
 
 @register_single_dim_strategy(
     [aten.native_layer_norm.default],
     schema_info=RuntimeSchemaInfo(1),
+    allow_uneven_sharding=True,
 )
 def layer_norm_single_dim_strategy(
     op: torch._ops.OpOverload,
@@ -1398,15 +1391,26 @@ def layer_norm_single_dim_strategy(
 @register_single_dim_strategy(
     [aten._fused_rms_norm.default],
     schema_info=RuntimeSchemaInfo(1),
+    allow_uneven_sharding=True,
 )
 def rms_norm_single_dim_strategy(
     op: torch._ops.OpOverload,
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    if len(args_schema) != 4:
+        raise AssertionError(f"Expected 4 args, got {len(args_schema)}")
     input_meta = args_schema[0]
     normalized_shape = args_schema[1]
     weight_meta = args_schema[2]
+    if not isinstance(input_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
+    if not isinstance(normalized_shape, (int, Sequence, torch.Size)):
+        raise AssertionError(
+            f"Expected int, Sequence, or torch.Size, got {type(normalized_shape)}"
+        )
+    if weight_meta is not None and not isinstance(weight_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(weight_meta)}")
 
     axis = len(input_meta.shape) - len(normalize_to_torch_size(normalized_shape))
 
@@ -1424,6 +1428,113 @@ def rms_norm_single_dim_strategy(
     return strategies
 
 
+def _norm_backward_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+    rms_norm: bool = False,
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    """Single-dim strategy for layer_norm / rms_norm backward.
+
+    layer_norm_backward: args = (grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask)
+                         outputs = (d_input, d_weight, d_bias)
+    rms_norm_backward:   args = (grad_out, input, normalized_shape, rstd, weight, output_mask)
+                         outputs = (d_input, d_weight)
+
+    For outer dim d:
+    - d_input: Shard(d) (same shape as input)
+    - d_weight: Partial("sum") (reduced over outer dims)
+    - d_bias: Partial("sum") (reduced over outer dims) [layer_norm only]
+    - grad_out, input: Shard(d)
+    - mean, rstd: Shard(d) (outer dims only)
+    - weight, bias: Replicate
+    """
+    if not rms_norm:
+        # grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
+        grad_out_meta = args_schema[0]
+        input_meta = args_schema[1]  # input is arg 1
+        normalized_shape = args_schema[2]
+        mean_meta = args_schema[3]
+        rstd_meta = args_schema[4]
+        weight_meta = args_schema[5]
+        bias_meta = args_schema[6]
+        output_mask = args_schema[7]
+    else:
+        # grad_out, input, normalized_shape, rstd, weight, output_mask
+        grad_out_meta = args_schema[0]
+        input_meta = args_schema[1]
+        normalized_shape = args_schema[2]
+        rstd_meta = args_schema[3]
+        weight_meta = args_schema[4]
+        bias_meta = None
+        output_mask = args_schema[5]
+        mean_meta = None
+
+    if not isinstance(grad_out_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(grad_out_meta)}")
+    if not isinstance(input_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
+    if mean_meta is not None and not isinstance(mean_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(mean_meta)}")
+    if not isinstance(rstd_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(rstd_meta)}")
+    if weight_meta is not None and not isinstance(weight_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(weight_meta)}")
+    if bias_meta is not None and not isinstance(bias_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(bias_meta)}")
+    ndim = len(input_meta.shape)
+
+    if not isinstance(normalized_shape, (int, Sequence, torch.Size)):
+        raise AssertionError(
+            f"Expected int, Sequence, or torch.Size, got {type(normalized_shape)}"
+        )
+    normalized_size = normalize_to_torch_size(normalized_shape)
+    axis = ndim - len(normalized_size)
+    expected_mask_len = 2 if rms_norm else 3
+    if not isinstance(output_mask, list) or len(output_mask) != expected_mask_len:
+        raise AssertionError(
+            f"Expected output_mask to be list of length {expected_mask_len}, "
+            f"got {type(output_mask)}"
+        )
+    if weight_meta is None and output_mask[1] is not False:
+        raise AssertionError(
+            "output_mask[1] should not be `True` while weight argument is `None`."
+        )
+    if not rms_norm and bias_meta is None and output_mask[2] is not False:
+        raise AssertionError(
+            "output_mask[2] should not be `True` while bias argument is `None`."
+        )
+
+    strategies: list[list[Placement | _ShardingPlaceholder | None]] = []
+    for d in range(axis):
+        rule: list[Placement | _ShardingPlaceholder | None] = []
+
+        # Outputs: d_input shards on d, d_weight/d_bias are Partial("sum") or None
+        rule.append(_ShardingPlaceholder(d))  # d_input
+        if output_mask[1]:
+            rule.append(Partial("sum"))  # d_weight
+        else:
+            rule.append(None)  # d_weight masked out
+        if not rms_norm:
+            if output_mask[2]:
+                rule.append(Partial("sum"))  # d_bias
+            else:
+                rule.append(None)  # d_bias masked out
+
+        rule.append(_ShardingPlaceholder(d))  # grad_out
+        rule.append(_ShardingPlaceholder(d))  # input
+        if not rms_norm:
+            rule.append(_ShardingPlaceholder(d))  # mean
+        rule.append(_ShardingPlaceholder(d))  # rstd
+        if weight_meta is not None:
+            rule.append(Replicate())  # weight
+        if not rms_norm and bias_meta is not None:
+            rule.append(Replicate())  # bias
+
+        strategies.append(rule)
+    return cast(list[list[Placement | _ShardingPlaceholder]], strategies)
+
+
 @register_single_dim_strategy(
     [aten.native_layer_norm_backward.default],
     schema_info=RuntimeSchemaInfo(2),
@@ -1432,40 +1543,8 @@ def layer_norm_bwd_single_dim_strategy(
     op: torch._ops.OpOverload,
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
-) -> list[list[Placement | _ShardingPlaceholder | None]]:
-    input_meta = args_schema[1]
-    normalized_shape = args_schema[2]
-    # mean = args_schema[3], rstd = args_schema[4]
-    weight_meta = args_schema[5]
-    bias_meta = args_schema[6]
-
-    axis = len(input_meta.shape) - len(normalize_to_torch_size(normalized_shape))
-
-    strategies: list[list[Placement | _ShardingPlaceholder | None]] = []
-    for dim in range(axis):
-        # outputs: [d_input, d_weight, d_bias] — always 3 per schema
-        # d_weight/d_bias use None when weight/bias are None
-        rule: list[Placement | _ShardingPlaceholder | None] = [
-            _ShardingPlaceholder(dim),  # d_input
-            Partial("sum") if weight_meta is not None else None,  # d_weight
-            Partial("sum") if bias_meta is not None else None,  # d_bias
-        ]
-        # inputs: [grad_out, input, mean, rstd, weight?, bias?]
-        rule.extend(
-            [
-                _ShardingPlaceholder(dim),  # grad_out
-                _ShardingPlaceholder(dim),  # input
-                _ShardingPlaceholder(dim),  # mean
-                _ShardingPlaceholder(dim),  # rstd
-            ]
-        )
-        if weight_meta is not None:
-            rule.append(Replicate())
-        if bias_meta is not None:
-            rule.append(Replicate())
-        strategies.append(rule)
-
-    return strategies
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    return _norm_backward_single_dim_strategy(op, args_schema, kwargs_schema)
 
 
 @register_single_dim_strategy(
@@ -1476,22 +1555,45 @@ def rms_norm_bwd_single_dim_strategy(
     op: torch._ops.OpOverload,
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
-) -> list[list[Placement | _ShardingPlaceholder | None]]:
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    if len(args_schema) != 6:
+        raise AssertionError(f"Expected 6 args, got {len(args_schema)}")
+    grad_out_meta = args_schema[0]
     input_meta = args_schema[1]
     normalized_shape = args_schema[2]
-    # rstd = args_schema[3]
+    rstd_meta = args_schema[3]
     weight_meta = args_schema[4]
+    output_mask = args_schema[5]
+
+    if not isinstance(grad_out_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(grad_out_meta)}")
+    if not isinstance(input_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
+    if not isinstance(normalized_shape, (int, Sequence, torch.Size)):
+        raise AssertionError(
+            f"Expected int, Sequence, or torch.Size, got {type(normalized_shape)}"
+        )
+    if not isinstance(rstd_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(rstd_meta)}")
+    if weight_meta is not None and not isinstance(weight_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(weight_meta)}")
+    if not isinstance(output_mask, list) or len(output_mask) != 2:
+        raise AssertionError(
+            f"Expected output_mask to be list of length 2, got {type(output_mask)}"
+        )
+    if weight_meta is None and output_mask[1] is not False:
+        raise AssertionError(
+            "output_mask[1] should not be `True` while weight argument is `None`."
+        )
 
     axis = len(input_meta.shape) - len(normalize_to_torch_size(normalized_shape))
 
     strategies: list[list[Placement | _ShardingPlaceholder | None]] = []
     for dim in range(axis):
-        # outputs: [d_input, d_weight] — always 2 per schema
-        # d_weight uses None when weight is None
-        # inputs: [grad_out, input, rstd, weight?]
+        # [d_input, d_weight, grad_out, input, rstd, weight?]
         rule: list[Placement | _ShardingPlaceholder | None] = [
-            _ShardingPlaceholder(dim),  # d_input
-            Partial("sum") if weight_meta is not None else None,  # d_weight
+            _ShardingPlaceholder(dim) if output_mask[0] else None,  # d_input
+            Partial("sum") if output_mask[1] else None,  # d_weight
             _ShardingPlaceholder(dim),  # grad_out
             _ShardingPlaceholder(dim),  # input
             _ShardingPlaceholder(dim),  # rstd
@@ -1500,7 +1602,7 @@ def rms_norm_bwd_single_dim_strategy(
             rule.append(Replicate())
         strategies.append(rule)
 
-    return strategies
+    return cast(list[list[Placement | _ShardingPlaceholder]], strategies)
 
 
 @register_single_dim_strategy(

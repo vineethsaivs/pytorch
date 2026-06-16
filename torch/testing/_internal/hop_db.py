@@ -16,7 +16,7 @@ from torch.nn.attention.flex_attention import (
 from torch.testing import make_tensor
 from torch._higher_order_ops.inline_asm_elementwise import inline_asm_elementwise
 from torch.testing._internal.common_dtype import all_types_and, custom_types, empty_types
-from torch.testing._internal.opinfo.core import OpInfo, SampleInput
+from torch.testing._internal.opinfo.core import DecorateInfo, OpInfo, SampleInput
 from torch._higher_order_ops.invoke_subgraph import mark_compile_region
 from torch._higher_order_ops import InvokeQuant, invoke_quant_packed
 from torch._higher_order_ops.register_hook import register_hook_op
@@ -492,6 +492,12 @@ hop_db = [
         check_batched_gradgrad=False,
         check_batched_forward_grad=False,
         check_inplace_batched_forward_grad=False,
+        decorators=[
+            DecorateInfo(
+                torch._dynamo.config.patch(nested_graph_breaks=False),
+                "TestBwdGradientsCPU",
+            ),
+        ],
     ),
     OpInfo(
         name="map",
@@ -504,6 +510,12 @@ hop_db = [
         check_batched_gradgrad=False,
         check_batched_forward_grad=False,
         check_inplace_batched_forward_grad=False,
+        decorators=[
+            DecorateInfo(
+                torch._dynamo.config.patch(nested_graph_breaks=False),
+                "TestBwdGradientsCPU",
+            ),
+        ],
     ),
     OpInfo(
         name="map",
@@ -516,6 +528,12 @@ hop_db = [
         check_batched_gradgrad=False,
         check_batched_forward_grad=False,
         check_inplace_batched_forward_grad=False,
+        decorators=[
+            DecorateInfo(
+                torch._dynamo.config.patch(nested_graph_breaks=False),
+                "TestBwdGradientsCPU",
+            ),
+        ],
     ),
     OpInfo(
         name="cond",

@@ -22,6 +22,7 @@
 #include <ATen/ops/clamp_min.h>
 #include <ATen/ops/sum.h>
 #include <ATen/ops/empty.h>
+#include <c10/util/env.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/log_softmax.h>
 #include <ATen/ops/nll_loss.h>
@@ -693,6 +694,14 @@ static bool can_use_fused_mps_cross_entropy(
     const Tensor& target,
     const std::optional<Tensor>& weight,
     double label_smoothing) {
+  // Escape hatch + same-build A/B (benchmarks/mps/bench_crossentropy.py): force
+  // the reference decomposed log_softmax + nll_loss path instead of the fused
+  // Metal kernel, without a rebuild.
+  static const bool force_decomposed =
+      c10::utils::has_env("PYTORCH_MPS_FORCE_DECOMPOSED_CROSS_ENTROPY");
+  if (force_decomposed) {
+    return false;
+  }
   if (!(self.is_mps() && self.dim() == 2 && target.dim() == 1 &&
         self.is_contiguous() &&
         (self.scalar_type() == kFloat || self.scalar_type() == kHalf ||

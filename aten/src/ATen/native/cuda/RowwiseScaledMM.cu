@@ -1047,11 +1047,22 @@ void dispatch_fp8_rowwise_kernel_on_bias_dtype(
         cutlass::half_t>
         (XQ, WQ, x_scale, w_scale, bias, use_fast_accum, out);
   } else {
-    dispatch_fp8_rowwise_kernel_on_input_dtypes<
-        float,
-        cutlass::bfloat16_t>
-        //Types...>
-        (XQ, WQ, x_scale, w_scale, bias, use_fast_accum, out);
+    if (out.dtype() == at::kFloat) {
+      dispatch_fp8_rowwise_kernel_on_input_dtypes<
+          float,
+          float>
+          (XQ, WQ, x_scale, w_scale, bias, use_fast_accum, out);
+    } else if (out.dtype() == at::kHalf) {
+      dispatch_fp8_rowwise_kernel_on_input_dtypes<
+          float,
+          cutlass::half_t>
+          (XQ, WQ, x_scale, w_scale, bias, use_fast_accum, out);
+    } else {
+      dispatch_fp8_rowwise_kernel_on_input_dtypes<
+          float,
+          cutlass::bfloat16_t>
+          (XQ, WQ, x_scale, w_scale, bias, use_fast_accum, out);
+    }
   }
 }
 
@@ -1098,7 +1109,10 @@ void check_inputs(
   }
 
   TORCH_CHECK(out.device() == a.device());
-  TORCH_CHECK(out.dtype() == at::kBFloat16 || out.dtype() == at::kHalf);
+  TORCH_CHECK(
+      out.dtype() == at::kBFloat16 || out.dtype() == at::kHalf ||
+          out.dtype() == at::kFloat,
+      "Output dtype must be bfloat16, float16, or float32, but got ", out.dtype());
   TORCH_CHECK(out.dim() == 2);
   TORCH_CHECK(out.size(0) == a.size(0));
   TORCH_CHECK(out.size(1) == b.size(1));

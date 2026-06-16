@@ -146,11 +146,11 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
   ~ProcessGroup() override;
 
   virtual int getRank() const {
-    return rank_;
+    return getDefaultBackend()->getRank();
   }
 
   virtual int getSize() const {
-    return size_;
+    return getDefaultBackend()->getSize();
   }
 
   // Returns a unique opaque ID of this process group object.
@@ -1054,14 +1054,23 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
   // Fault Tolerance / Reconfigure API. Forwards to the default backend; see
   // Backend.hpp for semantics.
   virtual bool supportsReconfigure() const {
+    TORCH_CHECK(
+        !hasMultipleBackends(),
+        "ProcessGroup reconfigure APIs do not support process groups with multiple backends.");
     return getDefaultBackend()->supportsReconfigure();
   }
 
   virtual ReconfigureHandle get_reconfigure_handle() const {
+    TORCH_CHECK(
+        !hasMultipleBackends(),
+        "ProcessGroup reconfigure APIs do not support process groups with multiple backends.");
     return getDefaultBackend()->get_reconfigure_handle();
   }
 
   virtual c10::intrusive_ptr<Work> reconfigure(const ReconfigureOptions& opts) {
+    TORCH_CHECK(
+        !hasMultipleBackends(),
+        "ProcessGroup reconfigure APIs do not support process groups with multiple backends.");
     return getDefaultBackend()->reconfigure(opts);
   }
 
@@ -1098,15 +1107,27 @@ class TORCH_API ProcessGroup : public torch::CustomClassHolder {
   // appropriate logging etc.
   void init();
 
+  bool hasMultipleBackends() const {
+    if (backendTypeToBackend_.size() > 1) {
+      return true;
+    }
+    if (deviceTypeToBackendType_.empty()) {
+      return false;
+    }
+    const auto firstBackendType = deviceTypeToBackendType_.begin()->second;
+    for (const auto& pair : deviceTypeToBackendType_) {
+      if (pair.second != firstBackendType) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   c10::intrusive_ptr<c10d::Store> store_;
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
-  const int rank_;
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
-  const int size_;
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   BackendType backendType_;
   std::string pg_desc_;
-  int64_t splitCounter_;
+  int64_t splitCounter_{0};
 
   // Debug level setting. It is parsed once when ProcessGroup is constructed and
   // remains the same across use of this process group.

@@ -1527,6 +1527,12 @@ class TritonTemplateKernel(TritonKernel):
                         old_name = lookup_output.symbol()
                         lookup_output.set_name(name)
                         # Update var_list and var_range
+                        old_entry = self.range_tree_nodes.pop(old_name)
+                        if old_entry is not lookup_output:
+                            raise AssertionError(
+                                "range_tree_nodes is inconsistent with range_tree"
+                            )
+                        self.range_tree_nodes[symbol] = lookup_output
                         range_tree.var_list[range_tree.var_list.index(old_name)] = (
                             symbol
                         )

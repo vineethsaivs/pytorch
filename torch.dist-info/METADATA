@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: torch
+Summary: Tensors and Dynamic neural networks in Python with strong GPU acceleration
+Home-page: https://pytorch.org/
+Author: PyTorch Team
+License: BSD-3
+Platform: UNKNOWN

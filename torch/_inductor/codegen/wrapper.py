@@ -1827,6 +1827,11 @@ class PythonWrapperCodegen(CodeGen):
         for idx in inputs_to_check:
             if idx not in mutated_idxs:
                 name = V.graph.graph_input_names[idx]
+                if name in V.graph.data_ptr_keepalive_buffers:
+                    # data_ptr() exposes the input's actual address, so an
+                    # alignment clone would change observable pointer identity.
+                    V.graph._defers_input_alignment = True
+                    continue
                 self._pending_alignment_copies.add(name)
         if self._pending_alignment_copies:
             V.graph._defers_input_alignment = True
@@ -4029,6 +4034,10 @@ class PythonWrapperCodegen(CodeGen):
 
     def codegen_free(self, buffer):
         name = buffer.get_name()
+        if name in V.graph.data_ptr_keepalive_buffers:
+            # Later opaque kernels may dereference the raw address returned by
+            # data_ptr(), so keep the backing tensor live through the call.
+            return
 
         # can be freed but not reused
         if isinstance(buffer, (ir.InputBuffer, ir.TorchBindObject)):

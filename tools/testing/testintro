@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Launcher for the test-introspection tool.
+
+Run it directly from anywhere in the repo:
+
+    tools/testing/testintro diff --pr 167224 --job linux-cpu/default
+    tools/testing/testintro where test_foo --file test/test_x.py
+    tools/testing/testintro list --job linux-cuda-sm80/default --file test/test_ops.py --count
+
+If the current interpreter can't import torch, it re-execs under the repo's .venv
+(which has torch built), so activating the venv first is optional.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+
+
+def _ensure_torch_interpreter() -> None:
+    # Worker subprocesses run sys.executable, so this interpreter must have torch.
+    if os.environ.get("_TESTINTRO_REEXECED") or importlib.util.find_spec("torch"):
+        return
+    for base in (REPO, REPO.parent):
+        py = base / ".venv" / "bin" / "python"
+        if py.exists() and py.resolve() != Path(sys.executable).resolve():
+            os.environ["_TESTINTRO_REEXECED"] = "1"
+            os.execv(str(py), [str(py), str(Path(__file__).resolve()), *sys.argv[1:]])
+    sys.exit(
+        "testintro: torch is not importable and no .venv was found next to the repo; "
+        "activate the environment that has torch built."
+    )
+
+
+_ensure_torch_interpreter()
+sys.path.insert(0, str(REPO))
+
+from tools.testing.introspection.__main__ import main  # noqa: E402
+
+sys.exit(main())

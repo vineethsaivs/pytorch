@@ -4548,6 +4548,52 @@ class TestMPS(TestCaseMPS):
         helper([8, 4, 5, 7, 6], 'mean')
 
     # Mean Squared Error
+    def test_binary_cross_entropy_metal(self):
+        # Committed CI coverage for the native Metal BCE kernels (replaces the
+        # never-registered test_mps_loss_ops.py): all reductions x dtypes x
+        # weight, fwd + bwd vs fp32 CPU, and N=0 (sum->0, mean->NaN, none->empty).
+        def run(shape, reduction, dtype, weighted):
+            numel = 1
+            for d in shape:
+                numel *= d
+            xc = torch.empty(shape, dtype=torch.float32).uniform_(0.05, 0.95).requires_grad_()
+            yc = torch.randint(0, 2, shape).float()
+            wc = torch.rand(shape, dtype=torch.float32) if weighted else None
+            xm = xc.detach().to("mps", dtype).requires_grad_()
+            ym = yc.detach().to("mps", dtype)
+            wm = None if wc is None else wc.to("mps", dtype)
+            oc = F.binary_cross_entropy(xc, yc, weight=wc, reduction=reduction)
+            om = F.binary_cross_entropy(xm, ym, weight=wm, reduction=reduction)
+            tol = dict(atol=5e-2, rtol=5e-2) if dtype != torch.float32 else {}
+            self.assertEqual(om.float(), oc, equal_nan=True, **tol)
+            if numel > 0:
+                g = torch.ones_like(oc)
+                oc.backward(g)
+                om.backward(g.to("mps", dtype))
+                self.assertEqual(xm.grad.float(), xc.grad, equal_nan=True, **tol)
+
+        for reduction in ("none", "mean", "sum"):
+            for dtype in (torch.float32, torch.float16, torch.bfloat16):
+                for weighted in (False, True):
+                    run((64, 33), reduction, dtype, weighted)
+            run((0,), reduction, torch.float32, False)  # empty input
+
+        # Non-contiguous grad_input regression: the functional backward allocates
+        # grad_input = empty_like(input), so a transposed input yields a
+        # non-contiguous grad_input that the linear kernel write corrupted before
+        # the contiguous-buffer copy-back was added.
+        xb = torch.empty(48, 64).uniform_(1e-3, 1 - 1e-3)
+        x_nc_cpu = xb.t()
+        x_nc_mps = xb.to("mps").t()
+        self.assertFalse(x_nc_mps.is_contiguous())
+        y_nc = torch.randint(0, 2, (64, 48)).float()
+        go = torch.randn(64, 48)
+        gi_cpu = torch.ops.aten.binary_cross_entropy_backward(go, x_nc_cpu, y_nc, None, 0)
+        gi_mps = torch.ops.aten.binary_cross_entropy_backward(
+            go.to("mps"), x_nc_mps, y_nc.to("mps"), None, 0)
+        self.assertFalse(gi_mps.is_contiguous())  # confirms the non-contig grad_input path is exercised
+        self.assertEqual(gi_mps.cpu(), gi_cpu)
+
     def test_mse_loss(self):
         def helper(shape, reduction):
             # create the criterion

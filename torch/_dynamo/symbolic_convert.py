@@ -1112,7 +1112,8 @@ def break_graph_if_unsupported(
 
                 if isinstance(excp, Unsupported):
                     excp.remove_from_stats()
-                    excp.add_to_stats("graph_break")
+                    if excp.record_graph_break:
+                        excp.add_to_stats("graph_break")
                 speculation.reason = GraphCompileReason(
                     getattr(excp, "msg", str(excp)),
                     getattr(excp, "real_stack", [self.frame_summary()]),

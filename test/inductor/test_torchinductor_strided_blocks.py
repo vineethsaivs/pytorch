@@ -2256,6 +2256,70 @@ class TestTilingExtra(InductorTestCase):
             )
 
 
+@unittest.skipIf(
+    not (HAS_CUDA_AND_TRITON and torch.cuda.get_device_capability()[0] >= 9)
+    or torch.version.hip,
+    "Requires Triton CUDA backend and CUDA compute capability >= 9.0. Not supported on ROCm",
+)
+@config.patch(
+    {
+        "triton.use_tensor_descriptor": True,
+        "triton.enable_host_side_tma": True,
+        "assume_aligned_inputs": True,
+    }
+)
+@instantiate_parametrized_tests
+class TritonHostSideTMATestCUDA(BlockDescriptorTestBase):
+    """Run the full pointwise/reduction suite with host-side TMA.
+    Block pointer count is skipped because host-side TMA creates
+    descriptors in the launcher, not the kernel."""
+
+    device = GPU_TYPE
+
+    def _run_and_compare(self, *args, **kwargs):
+        kwargs["expected_num_block_pointers"] = None
+        return super()._run_and_compare(*args, **kwargs)
+
+
+test_torchinductor.copy_tests(
+    CommonTemplate, TritonHostSideTMATestCUDA, GPU_TYPE
+)
+
+# The (9, True) meta-test checks that _run_and_compare raises on wrong block
+# pointer counts. Host-side TMA disables this count check, so skip it.
+TritonHostSideTMATestCUDA.test_expected_num_block_pointers_expected_num_block_pointers_9_raises_True_cuda = unittest.skip(
+    "block pointer count check is disabled for host-side TMA"
+)(
+    TritonHostSideTMATestCUDA.test_expected_num_block_pointers_expected_num_block_pointers_9_raises_True_cuda
+)
+
+# Known TMA API limitations: these cases also fail for device-side TMA (they
+# carry @xfail_if_use_tensor_descriptor). For host-side TMA they either produce
+# different (still-correct) codegen that breaks the device-specific code asserts,
+# or hit the same descriptor constraints (e.g. the 16-byte last-dim minimum in
+# test_reduction_padded_output_tiling).
+_HOST_TMA_EXPECTED_FAILURES = [
+    "test_boundary_check_block_multiple_False_ynumel_exceed_ygrid_size_False_include_z_True_cuda",
+    "test_boundary_check_block_multiple_True_ynumel_exceed_ygrid_size_True_include_z_False_cuda",
+    "test_pointwise_broadcast_nonzero_strides_prefer_nd_tiling_False_cuda",
+    "test_pointwise_broadcast_nonzero_strides_prefer_nd_tiling_True_cuda",
+    "test_pointwise_index_order_cuda",
+    "test_reduction_padded_output_tiling_cuda",
+]
+for _name in _HOST_TMA_EXPECTED_FAILURES:
+    setattr(
+        TritonHostSideTMATestCUDA,
+        _name,
+        unittest.expectedFailure(getattr(TritonHostSideTMATestCUDA, _name)),
+    )
+
+# Dynamic shapes are not yet supported for host-side TMA (the launcher cannot
+# resolve symbolic block/shape dims). Tracked as a follow-up.
+TritonHostSideTMATestCUDA.test_dynamic_shapes_pointwise_nd_tiling_False_num_block_pointers_1_cuda = unittest.expectedFailure(
+    TritonHostSideTMATestCUDA.test_dynamic_shapes_pointwise_nd_tiling_False_num_block_pointers_1_cuda
+)
+
+
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 

@@ -820,6 +820,15 @@ def compile_fx_inner(
             stack.enter_context(
                 config.patch(get_cpp_wrapper_config(log_cudagraph_skip=False))
             )
+        if config.triton.enable_host_side_tma:
+            stack.enter_context(
+                config.patch(
+                    {
+                        "triton.use_tensor_descriptor": True,
+                        "assume_aligned_inputs": True,
+                    }
+                )
+            )
         stack.enter_context(torch.utils._python_dispatch._disable_current_modes())
         stack.enter_context(_use_lazy_graph_module(dynamo_config.use_lazy_graph_module))
         stack.enter_context(

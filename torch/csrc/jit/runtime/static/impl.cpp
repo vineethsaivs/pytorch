@@ -41,6 +41,7 @@
 #include <common/logging/logging.h>
 #include <folly/dynamic.h>
 #include <folly/json.h>
+// @allow-raw-throw
 #endif
 
 // used in test only

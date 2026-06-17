@@ -22,6 +22,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+// @allow-raw-throw
 
 namespace torch::jit {
 

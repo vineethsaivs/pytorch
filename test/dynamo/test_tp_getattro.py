@@ -239,6 +239,24 @@ class TpGetattroTests(torch._dynamo.test_case.TestCase):
         result = torch.compile(fn, backend="eager")(MyObj())
         self.assertEqual(result, 123)
 
+    def test_udov_non_function_getattr_graph_breaks(self):
+        """Non-function __getattr__ (callable instance) triggers a graph break."""
+
+        class CallableGetattr:
+            def __call__(self, name):
+                return 42
+
+        class MyObj:
+            __getattr__ = CallableGetattr()
+
+        def fn(obj):
+            return obj.dynamic
+
+        cnt = torch._dynamo.testing.CompileCounter()
+        result = torch.compile(fn, backend=cnt)(MyObj())
+        self.assertEqual(result, 42)
+        self.assertEqual(cnt.frame_count, 0)
+
     def test_udov_getattribute_override(self):
         class MyObj:
             def __getattribute__(self, name):

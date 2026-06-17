@@ -3277,47 +3277,9 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 pass
 
         # Step 6: __getattr__ fallback.
-        getattr_fn = self._check_for_getattr()
-        if isinstance(getattr_fn, types.FunctionType):
-            if (
-                getattr_fn is unpatched_nn_module_getattr
-                and isinstance(self, variables.UnspecializedNNModuleVariable)
-                and istype(self.value._parameters, dict)  # type: ignore[attr-defined]
-                and istype(self.value._buffers, dict)  # type: ignore[attr-defined]
-                and istype(self.value._modules, dict)  # type: ignore[attr-defined]
-            ):
-                out = self.manually_trace_nn_module_getattr(tx, name)
-            else:
-                new_source = None
-                if self.source:
-                    new_source = AttrSource(self.source, "__getattr__")
-                out = variables.UserMethodVariable(
-                    getattr_fn, self, source=new_source
-                ).call_function(tx, [variables.ConstantVariable.create(name)], {})
-
-            if self.source and getattr_fn is torch.nn.Module.__getattr__:
-                if isinstance(
-                    out,
-                    (
-                        variables.UnspecializedNNModuleVariable,
-                        variables.NNModuleVariable,
-                    ),
-                ):
-                    out.set_nn_module_stack_source(  # type: ignore[attr-defined]
-                        AttrSource(self.get_nn_module_stack_source(), name)  # type: ignore[attr-defined]
-                    )
-            return out
-
-        elif getattr_fn is not None:
-            unimplemented(
-                gb_type="User-defined object with non-function __getattr__",
-                context=f"object={self.value}, name={name}, getattr_fn={getattr_fn}",
-                explanation=f"Found a non-function __getattr__ {getattr_fn} from a user-defined object {self.value} "
-                f" when attempting to getattr `{name}`",
-                hints=[
-                    "Ensure the object's __getattr__ is a function type.",
-                ],
-            )
+        result = self.call_getattr_fallback(tx, name)
+        if result is not None:
+            return result
 
         # Step 7: AttributeError.
         raise_observed_exception(
@@ -3596,6 +3558,53 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             subobj = self.value.__dict__[name]
             source = self.maybe_wrap_nn_module_source_for_instance(tx, name, source)
             return VariableTracker.build(tx, subobj, source)
+
+        return None
+
+    def call_getattr_fallback(
+        self, tx: "InstructionTranslatorBase", name: str
+    ) -> VariableTracker | None:
+        getattr_fn = self._check_for_getattr()
+        if isinstance(getattr_fn, types.FunctionType):
+            if (
+                getattr_fn is unpatched_nn_module_getattr
+                and isinstance(self, variables.UnspecializedNNModuleVariable)
+                and istype(self.value._parameters, dict)  # type: ignore[attr-defined]
+                and istype(self.value._buffers, dict)  # type: ignore[attr-defined]
+                and istype(self.value._modules, dict)  # type: ignore[attr-defined]
+            ):
+                out = self.manually_trace_nn_module_getattr(tx, name)
+            else:
+                new_source = None
+                if self.source:
+                    new_source = AttrSource(self.source, "__getattr__")
+                out = variables.UserMethodVariable(
+                    getattr_fn, self, source=new_source
+                ).call_function(tx, [variables.ConstantVariable.create(name)], {})
+
+            if self.source and getattr_fn is torch.nn.Module.__getattr__:
+                if isinstance(
+                    out,
+                    (
+                        variables.UnspecializedNNModuleVariable,
+                        variables.NNModuleVariable,
+                    ),
+                ):
+                    out.set_nn_module_stack_source(  # type: ignore[attr-defined]
+                        AttrSource(self.get_nn_module_stack_source(), name)  # type: ignore[attr-defined]
+                    )
+            return out
+
+        elif getattr_fn is not None:
+            unimplemented(
+                gb_type="User-defined object with non-function __getattr__",
+                context=f"object={self.value}, name={name}, getattr_fn={getattr_fn}",
+                explanation=f"Found a non-function __getattr__ {getattr_fn} from a user-defined object {self.value} "
+                f" when attempting to getattr `{name}`",
+                hints=[
+                    "Ensure the object's __getattr__ is a function type.",
+                ],
+            )
 
         return None
 

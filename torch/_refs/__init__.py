@@ -3430,6 +3430,95 @@ def native_group_norm(
     return (out, mean, rstd)
 
 
+_SCALAR_TYPE_NAMES = {
+    torch.uint8: "Byte",
+    torch.int8: "Char",
+    torch.int16: "Short",
+    torch.int32: "Int",
+    torch.int64: "Long",
+    torch.float16: "Half",
+    torch.float32: "Float",
+    torch.float64: "Double",
+    torch.complex32: "ComplexHalf",
+    torch.complex64: "ComplexFloat",
+    torch.complex128: "ComplexDouble",
+    torch.bool: "Bool",
+    torch.qint8: "QInt8",
+    torch.quint8: "QUInt8",
+    torch.qint32: "QInt32",
+    torch.bfloat16: "BFloat16",
+    torch.quint4x2: "QUInt4x2",
+    torch.quint2x4: "QUInt2x4",
+    torch.bits1x8: "Bits1x8",
+    torch.bits2x4: "Bits2x4",
+    torch.bits4x2: "Bits4x2",
+    torch.bits8: "Bits8",
+    torch.bits16: "Bits16",
+    torch.float8_e5m2: "Float8_e5m2",
+    torch.float8_e4m3fn: "Float8_e4m3fn",
+    torch.float8_e5m2fnuz: "Float8_e5m2fnuz",
+    torch.float8_e4m3fnuz: "Float8_e4m3fnuz",
+    torch.uint16: "UInt16",
+    torch.uint32: "UInt32",
+    torch.uint64: "UInt64",
+    torch.float8_e8m0fnu: "Float8_e8m0fnu",
+    torch.float4_e2m1fn_x2: "Float4_e2m1fn_x2",
+    torch.bcomplex32: "BComplex32",
+}
+
+for _dtype_attr, _dtype_name in (
+    ("uint1", "UInt1"),
+    ("uint2", "UInt2"),
+    ("uint3", "UInt3"),
+    ("uint4", "UInt4"),
+    ("uint5", "UInt5"),
+    ("uint6", "UInt6"),
+    ("uint7", "UInt7"),
+    ("int1", "Int1"),
+    ("int2", "Int2"),
+    ("int3", "Int3"),
+    ("int4", "Int4"),
+    ("int5", "Int5"),
+    ("int6", "Int6"),
+    ("int7", "Int7"),
+):
+    _dtype = getattr(torch, _dtype_attr, None)
+    if _dtype is not None:
+        _SCALAR_TYPE_NAMES[_dtype] = _dtype_name
+
+
+def _scalar_type_name(dtype: torch.dtype) -> str:
+    return _SCALAR_TYPE_NAMES.get(dtype, str(dtype).removeprefix("torch."))
+
+
+def _check_native_layer_norm_cuda_param_dtype(
+    input: Tensor,
+    normalized_ndim: int,
+    weight: Tensor | None,
+    bias: Tensor | None,
+) -> None:
+    if input.device.type != "cuda":
+        return
+
+    mismatched_dtype = None
+    if weight is not None and weight.dtype != input.dtype:
+        mismatched_dtype = weight.dtype
+    elif bias is not None and bias.dtype != input.dtype:
+        mismatched_dtype = bias.dtype
+
+    if mismatched_dtype is None:
+        return
+
+    axis = input.ndim - normalized_ndim
+    num_rows = math.prod(input.shape[:axis])
+    expected_dtype = _scalar_type_name(input.dtype)
+    found_dtype = _scalar_type_name(mismatched_dtype)
+    torch._check(
+        num_rows == 0,
+        lambda: f"expected scalar type {expected_dtype} but found {found_dtype}",
+    )
+
+
 @register_decomposition(aten.native_layer_norm)
 @out_wrapper("out0", "out1", "out2")
 def native_layer_norm(
@@ -3486,6 +3575,7 @@ def native_layer_norm(
         not input.is_complex(),
         lambda: "native_layer_norm does not support complex inputs",
     )
+    _check_native_layer_norm_cuda_param_dtype(input, normalized_ndim, weight, bias)
 
     input = contiguous(input)
     if weight is not None:

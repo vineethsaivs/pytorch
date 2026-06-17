@@ -212,7 +212,7 @@
     "def sdpa_constraint()": 135,
     "def searchsorted()": 95
   },
-  "torch/_inductor/mkldnn_ir.py": {
+  "torch/_inductor/onednn_ir.py": {
     "class MkldnnRnnLayer": 121,
     "def MkldnnRnnLayer.create()": 101,
     "def QConvPointWiseBinaryPT2E.create()": 81

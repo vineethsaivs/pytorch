@@ -1736,7 +1736,7 @@ class PythonWrapperCodegen(CodeGen):
 
         with self.prefix.indent(prefix_indent):
             if config.triton.debug_sync_graph:
-                self.prefix.writeline(V.graph.device_ops.synchronize())
+                self.generate_debug_sync(self.prefix)
             phase = V.graph.get_training_phase()
             if config.annotate_training:
                 self.prefix.writeline(
@@ -2285,7 +2285,7 @@ class PythonWrapperCodegen(CodeGen):
             output_refs = self.get_output_refs()
             self.mark_output_type()
             if config.triton.debug_sync_graph:
-                self.wrapper_call.writeline(V.graph.device_ops.synchronize())
+                self.generate_debug_sync(self.wrapper_call)
 
             if config.profile_bandwidth:
                 self.generate_end_graph()
@@ -3005,6 +3005,7 @@ class PythonWrapperCodegen(CodeGen):
         reset_to_zero_args,
         grids: list[list[int | sympy.Expr]],
         epilogue_fusion: tuple[ir.ComputedBuffer, str] | None,
+        launch_kwargs: tuple[str, ...],
     ):
         """Codegen a user-defined Triton kernel and return its cache entry.
 
@@ -3015,6 +3016,10 @@ class PythonWrapperCodegen(CodeGen):
         inductor_meta, extra_launcher_call_args)``; subsequent calls with the
         same ``cache_key`` reuse the previously assigned name.
         """
+        from torch._dynamo.device_interface import get_interface_for_device
+
+        from ..runtime.triton_compat import GPUTarget
+        from ..runtime.triton_helpers import try_filter_backend_options_for_target
         from ..runtime.triton_heuristics import (
             config_to_dict,
             FixedGrid,
@@ -3142,9 +3147,11 @@ class PythonWrapperCodegen(CodeGen):
             indices=arg_indices,
             argdefs=[ArgName(x) for x in kernel.arg_names],
         )
+        device = V.graph.get_current_device_or_throw()
+        device_props = DeviceProperties.create(device)
         triton_meta: dict[str, Any] = {
             "signature": triton_signature,
-            "device": DeviceProperties.create(V.graph.get_current_device_or_throw()),
+            "device": device_props,
             # Triton compiler includes equal_to_1 args into constants even
             # when they are not constexpr. otherwise there may be a segfault
             # during launching the Inductor-compiled Triton kernel.
@@ -3170,6 +3177,29 @@ class PythonWrapperCodegen(CodeGen):
 
         if reset_to_zero_args:
             triton_meta["reset_to_zero"] = tuple(reset_to_zero_args)
+
+        backend_option_candidates = {
+            name: kwargs[name] for name in launch_kwargs if name in kwargs
+        }
+        if backend_option_candidates:
+            get_interface_for_device(device).raise_if_triton_unavailable(device)
+            assert GPUTarget is not None  # noqa: S101
+            target = GPUTarget(
+                device_props.type,
+                device_props.cc,
+                device_props.warp_size_or_default,
+            )
+            # HOP capture deliberately keeps an over-approximation of launch kwargs so
+            # a concrete kwarg can still have Triton's direct-call dual meaning:
+            # kernel parameter plus backend option. Once the target backend is known,
+            # only names accepted by parse_options() should be serialized into
+            # triton_meta["backend_options"]. Names that are neither kernel parameters
+            # nor backend options are invalid launch kwargs, matching eager Triton.
+            filtered_backend_options = try_filter_backend_options_for_target(
+                target, backend_option_candidates, kernel.arg_names
+            )
+            if filtered_backend_options:
+                triton_meta["backend_options"] = filtered_backend_options
 
         if len(grids) == 1:
             # compute the grid in the wrapper and pass it in as an arg
@@ -3390,6 +3420,9 @@ class PythonWrapperCodegen(CodeGen):
 
     def wrap_kernel_call(self, name, call_args):
         return f"{name}({', '.join(call_args)}){self.ending}"
+
+    def generate_debug_sync(self, buffer):
+        buffer.writeline(V.graph.device_ops.synchronize())
 
     def generate_profiler_mark_wrapper_call(self, stack):
         self.wrapper_call.writeline("from torch.profiler import record_function")

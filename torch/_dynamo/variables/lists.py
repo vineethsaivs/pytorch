@@ -58,6 +58,7 @@ from .functions import UserFunctionVariable
 from .iter import IteratorVariable
 from .object_protocol import (
     generic_richcompare_bool,
+    pylong_as_ssize_t,
     pyindex_check,
     type_implements_nb_index,
     validate_sequence_index,
@@ -1387,6 +1388,19 @@ class DequeVariable(CommonListMethodsVariable):
 
         raise_type_error(tx, f"unhashable type: '{self.python_type_name()}'")
 
+    @staticmethod
+    def validate_maxlen(
+        tx: "InstructionTranslatorBase", maxlen: VariableTracker
+    ) -> None:
+        # deque_init: maxlenobj != Py_None is run through PyLong_AsSsize_t.
+        # https://github.com/python/cpython/blob/v3.13.0/Modules/_collectionsmodule.c#L1729-L1736
+        if isinstance(maxlen, ConstantVariable) and maxlen.value is None:
+            return
+        if pylong_as_ssize_t(tx, maxlen) < 0:
+            raise_observed_exception(
+                ValueError, tx, args=["maxlen must be non-negative"]
+            )
+
     def __init__(
         self,
         items: list[VariableTracker],
@@ -1545,6 +1559,26 @@ class DequeVariable(CommonListMethodsVariable):
             slice_within_maxlen = slice(-maxlen, None)
         else:
             slice_within_maxlen = None
+
+        if name == "__init__" and self.is_mutable():
+            # deque_init: https://github.com/python/cpython/blob/v3.13.0/Modules/_collectionsmodule.c#L1810
+            # Re-init resets maxlen (to None unless given), clears the deque,
+            # then extends with the iterable.
+            iterable = args[0] if len(args) >= 1 else kwargs.pop("iterable", None)
+            new_maxlen = (
+                args[1]
+                if len(args) >= 2
+                else kwargs.pop("maxlen", ConstantVariable.create(None))
+            )
+            if len(args) > 2 or kwargs:
+                raise_args_mismatch(tx, name)
+            self.validate_maxlen(tx, new_maxlen)
+            tx.output.side_effects.mutation(self)
+            self.maxlen = new_maxlen
+            self.items.clear()
+            if iterable is not None:
+                self.call_method(tx, "extend", [iterable], {})
+            return ConstantVariable.create(None)
 
         if name == "extendleft" and self.is_mutable() and len(args) > 0:
             if kwargs or len(args) != 1:

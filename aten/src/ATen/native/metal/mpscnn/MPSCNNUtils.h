@@ -5,6 +5,7 @@ C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wdeprecated-declarations")
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 C10_DIAGNOSTIC_POP()
 #include <string>
+// @allow-raw-throw
 
 // This is a utility macro that can be used to throw an exception when a Metal
 // API function produces a NSError. The exception will contain a message with

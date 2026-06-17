@@ -305,7 +305,7 @@ bool is_two_level_nvfp4(
 //
 // Uses sym_numel()/sym_size() so dynamic-shape tracing through Dynamo
 // (which materializes scale tensors as fakes with symbolic dims) still
-// goes through this path -- raw numel()/size() throw on symbolic shapes.
+// goes through this path -- raw numel()/size() error on symbolic shapes.
 void validate_scaled_mm_v2_inputs(
     const Tensor& mat_a,
     const Tensor& mat_b,

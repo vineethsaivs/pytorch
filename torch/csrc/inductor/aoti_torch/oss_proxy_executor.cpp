@@ -8,6 +8,7 @@
 #include <torch/csrc/inductor/aoti_torch/generated_enum_converters.h>
 #include <torch/csrc/inductor/aoti_torch/oss_proxy_executor.h>
 #include <torch/csrc/jit/serialization/pickle.h>
+// @allow-raw-throw
 
 namespace {
 at::Tensor* tensor_handle_to_tensor_pointer(AtenTensorHandle handle) {

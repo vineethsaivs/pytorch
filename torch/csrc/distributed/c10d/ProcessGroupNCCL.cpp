@@ -37,6 +37,7 @@
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 #include <torch/torch.h>
 #include <optional>
+// @allow-raw-throw
 
 namespace c10d {
 

@@ -13,6 +13,7 @@
 #include <torch/csrc/shim_exception_state.h>
 #include <optional>
 #include <type_traits>
+// @allow-raw-throw
 
 namespace torch::aot_inductor {
 TORCH_API const char* get_last_error();

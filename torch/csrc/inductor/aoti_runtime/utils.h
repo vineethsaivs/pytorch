@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+// @allow-raw-throw
 
 // WARNING: Be careful when adding new includes here. This header will be used
 // in model.so, and should not refer to any aten/c10 headers except the stable

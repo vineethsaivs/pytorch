@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <torch/csrc/distributed/c10d/control_plane/WorkerServer.hpp>
 #include <torch/csrc/distributed/c10d/logging.h>
+// @allow-raw-throw
 
 namespace c10d::control_plane {
 

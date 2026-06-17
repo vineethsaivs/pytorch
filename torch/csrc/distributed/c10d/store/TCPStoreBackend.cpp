@@ -17,6 +17,7 @@
 #endif
 
 #include <torch/csrc/distributed/c10d/socket.h>
+// @allow-raw-throw
 
 namespace c10d::detail {
 

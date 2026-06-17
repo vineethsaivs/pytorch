@@ -13,6 +13,7 @@
 // applies to other files under torch/csrc/inductor/aoti_runtime/.
 #include <torch/csrc/inductor/aoti_runtime/interface.h>
 #include <torch/csrc/inductor/aoti_runtime/model.h>
+// @allow-raw-throw
 
 namespace torch::aot_inductor {
 // The state transition is done by:

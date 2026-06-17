@@ -350,7 +350,7 @@ bool check_data_ptr_alignment_mem_efficient(sdp_params const& params, bool debug
   // which exceeds the alignment_bytes the CUTLASS kernels require. So pointer
   // alignment is fully determined by storage_offset * element_size. Computing
   // it symbolically avoids touching data_ptr() (which calls numel() and would
-  // throw on FakeTensors with symbolic shapes during tracing).
+  // error on FakeTensors with symbolic shapes during tracing).
   const auto offset_bytes = [](const at::Tensor& tensor) {
     return tensor.sym_storage_offset() * tensor.element_size();
   };

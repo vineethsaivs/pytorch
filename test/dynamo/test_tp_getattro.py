@@ -104,6 +104,58 @@ class TpGetattroTests(torch._dynamo.test_case.TestCase):
         result = torch.compile(fn, backend="eager", fullgraph=True)(x)
         self.assertEqual(result, x + 1)
 
+    def test_hasattr_user_function_true(self):
+        def bar():
+            pass
+
+        def fn():
+            return hasattr(bar, "__name__")
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertTrue(result)
+
+    def test_hasattr_user_function_false(self):
+        def bar():
+            pass
+
+        def fn():
+            return hasattr(bar, "nonexistent")
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertFalse(result)
+
+    def test_hasattr_skip_function_true(self):
+        def fn():
+            return hasattr(print, "__name__")
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertTrue(result)
+
+    def test_hasattr_skip_function_false(self):
+        def fn():
+            return hasattr(print, "nonexistent")
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertFalse(result)
+
+    def test_hasattr_python_module_true(self):
+        import math
+
+        def fn():
+            return hasattr(math, "sqrt")
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertTrue(result)
+
+    def test_hasattr_python_module_false(self):
+        import math
+
+        def fn():
+            return hasattr(math, "nonexistent")
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertFalse(result)
+
     # --- Tensor attributes ---
 
     def test_tensor_shape(self):

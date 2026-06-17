@@ -5121,6 +5121,32 @@ class TestMPS(TestCaseMPS):
         output = loss(pred, target)
         output.backward()
 
+    def test_cross_entropy_metal_paths(self):
+        # Exercises the fused Metal / inductor-decomp cross_entropy paths that
+        # OpInfo's tiny samples never reach: a non-long (uint8) target under
+        # torch.compile (the decomposition must cast the gather index to long,
+        # mirroring the eager target.to(kLong)), plus label smoothing fwd+bwd
+        # and C>256 (the multi-simdgroup forward reduction).
+        # uint8 target under compile must match eager (C<256 so it is lossless).
+        N, C = 24, 200
+        logits = torch.randn(N, C, device="mps")
+        tgt = torch.randint(0, C, (N,), device="mps", dtype=torch.long)
+        ref = F.cross_entropy(logits, tgt)
+        compiled = torch.compile(F.cross_entropy)
+        self.assertEqual(compiled(logits, tgt.to(torch.uint8)), ref)
+        # C>256 multi-simdgroup forward + label smoothing, fwd + bwd vs fp32 CPU.
+        N2, C2 = 16, 4096
+        tc = torch.randint(0, C2, (N2,))
+        for ls in (0.0, 0.1):
+            lc = torch.randn(N2, C2, dtype=torch.float32, requires_grad=True)
+            lm = lc.detach().to("mps").requires_grad_()
+            oc = F.cross_entropy(lc, tc, label_smoothing=ls)
+            om = F.cross_entropy(lm, tc.to("mps"), label_smoothing=ls)
+            self.assertEqual(om, oc)
+            oc.backward()
+            om.backward()
+            self.assertEqual(lm.grad, lc.grad)
+
     def test_log_softmax(self):
         values = [[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]]
         cpu_x = torch.tensor(values, device='cpu', requires_grad=True)

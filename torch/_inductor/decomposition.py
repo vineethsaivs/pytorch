@@ -1093,7 +1093,7 @@ def _fused_cross_entropy_loss_2d_forward(
 
     not_ignored = target != ignore_index
     safe_target = torch.where(not_ignored, target, target.new_zeros(()))
-    safe_target_ = safe_target.unsqueeze(1)
+    safe_target_ = safe_target.long().unsqueeze(1)
     x_t = torch.gather(x, 1, safe_target_).squeeze(1)
 
     if weight is not None:
@@ -1145,7 +1145,7 @@ def _fused_cross_entropy_loss_2d_backward(
 
     not_ignored = target != ignore_index
     safe_target = torch.where(not_ignored, target, target.new_zeros(()))
-    safe_target_ = safe_target.unsqueeze(1)
+    safe_target_ = safe_target.long().unsqueeze(1)
     # Functional one-hot (no in-place scatter_, which AOTAutograd's functional
     # graph check rejects): one_hot[b, c] == 1 where c == target[b].
     class_idx = torch.arange(n_classes, device=x.device).view(1, n_classes)

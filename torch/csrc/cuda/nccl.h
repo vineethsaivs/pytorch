@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <optional>
 #include <vector>
+// @allow-raw-throw
 
 // NCCL BFloat16 is enabled for CUDA builds where the bf16 type exists and NCCL
 // is present (NCCL is required to be 2.23+), or for HIP 3.1+

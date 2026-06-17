@@ -50,6 +50,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+// @allow-raw-throw
 
 TORCH_SDT_DEFINE_SEMAPHORE(malloc)
 TORCH_SDT_DEFINE_SEMAPHORE(free)

@@ -6,6 +6,7 @@
 #include <torch/csrc/Storage.h>
 #include <torch/csrc/utils/object_ptr.h>
 
+// @allow-raw-throw
 #include <array>
 #include <stdexcept>
 
@@ -30,7 +31,7 @@ void registerLayoutObject(THPLayout* thp_layout, at::Layout layout) {
 THPDtype* getTHPDtype(at::ScalarType scalarType) {
   auto dtype = dtype_registry[static_cast<int>(scalarType)];
   if (!dtype) {
-    throw std::invalid_argument("unsupported scalarType");
+    TORCH_CHECK(false, "unsupported scalarType");
   }
   return dtype;
 }
@@ -38,7 +39,7 @@ THPDtype* getTHPDtype(at::ScalarType scalarType) {
 THPLayout* getTHPLayout(at::Layout layout) {
   auto thp_layout = layout_registry[static_cast<int>(layout)];
   if (!thp_layout) {
-    throw std::invalid_argument("unsupported at::Layout");
+    TORCH_CHECK(false, "unsupported at::Layout");
   }
   return thp_layout;
 }

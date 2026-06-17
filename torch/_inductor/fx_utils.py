@@ -21,7 +21,7 @@ import sympy
 import torch
 import torch.fx
 from torch._dispatch.python import enable_python_dispatcher
-from torch._inductor.fx_passes.control_dependencies import control_deps
+from torch._inductor.fx_passes.control_dependencies import control_deps, FUSE_REGION
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import (
     compute_unbacked_bindings,
@@ -347,7 +347,7 @@ def _extract_subgraphs_and_args(
         yield args[0], subgraph_args
         yield args[1], subgraph_args
     elif node.target is control_deps:
-        if kwargs:
+        if any(key != FUSE_REGION for key in kwargs):
             raise AssertionError(
                 "Subgraph arguments can be renamed, so we cannot consistently "
                 "handle kwargs at this point in the stack."
@@ -356,6 +356,8 @@ def _extract_subgraphs_and_args(
         control_deps_args = tuple(args[2:])
         if control_deps_subgraph in valid_subgraphs:
             yield control_deps_subgraph, control_deps_args
+        if kwargs.get(FUSE_REGION, False):
+            return
         if isinstance(
             control_deps_subgraph, torch.fx.GraphModule
         ) and pytree.tree_any_only(

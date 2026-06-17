@@ -15,6 +15,11 @@ from torch._dynamo.testing import _testing_capture_invoke_subgraph_inductor_comp
 from torch._functorch._aot_autograd.autograd_cache import BundledCompiledForward
 from torch._guards import detect_fake_mode
 from torch._higher_order_ops.invoke_subgraph import get_invoke_subgraph_compile_options
+from torch._inductor.fx_passes.control_dependencies import (
+    control_deps,
+    FUSE_REGION,
+    mark_fuse_region,
+)
 from torch._inductor.output_code import RegionalOutputCode
 from torch._inductor.test_case import run_tests
 from torch._inductor.utils import run_fw_bw_and_get_code
@@ -590,6 +595,84 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
 @torch._dynamo.config.patch("enable_invoke_subgraph_regional_compile", True)
 @instantiate_parametrized_tests
 class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
+    def _wrap_invoke_subgraph_nodes_with_fuse_region(
+        self, gm: torch.fx.GraphModule
+    ) -> torch.fx.GraphModule:
+        for node in list(
+            gm.graph.find_nodes(
+                op="call_function",
+                target=torch.ops.higher_order.invoke_subgraph,
+            )
+        ):
+            mark_fuse_region(gm.graph, [node])
+        gm.recompile()
+        return gm
+
+    def _assert_wrapped_invoke_subgraphs(self, gm: torch.fx.GraphModule) -> None:
+        control_deps_nodes = gm.graph.find_nodes(
+            op="call_function", target=control_deps
+        )
+        self.assertGreaterEqual(len(control_deps_nodes), 1)
+        for control_deps_node in control_deps_nodes:
+            self.assertIs(control_deps_node.kwargs.get(FUSE_REGION), True)
+            subgraph_attr = control_deps_node.args[1]
+            self.assertIsInstance(subgraph_attr, torch.fx.Node)
+            self.assertEqual(subgraph_attr.op, "get_attr")
+            self.assertIsInstance(subgraph_attr.target, str)
+
+            subgraph = getattr(gm, subgraph_attr.target)
+            invoke_subgraph_nodes = subgraph.graph.find_nodes(
+                op="call_function",
+                target=torch.ops.higher_order.invoke_subgraph,
+            )
+            self.assertEqual(len(invoke_subgraph_nodes), 1)
+            invoke_subgraph_attr = invoke_subgraph_nodes[0].args[0]
+            self.assertIsInstance(invoke_subgraph_attr, torch.fx.Node)
+            self.assertEqual(invoke_subgraph_attr.op, "get_attr")
+
+    @parametrize("serialize", [False])
+    def test_fuse_region_wraps_outer_forward_backward_hops(self, serialize):
+        nested_config = get_invoke_subgraph_compile_options()
+
+        @torch.compiler.nested_compile_region(options=nested_config)
+        def g(x, y):
+            return x * y + 1
+
+        def fn(x, y):
+            before = torch.sin(x)
+            region = g(before, y)
+            after = torch.sigmoid(region)
+            return after
+
+        captured_outer_gms = []
+
+        def regional_inductor_with_fuse_regions(gm, *args, **kwargs):
+            gm = self._wrap_invoke_subgraph_nodes_with_fuse_region(gm)
+            captured_outer_gms.append(copy.deepcopy(gm))
+            return regional_inductor_invoke_subgraph(gm, *args, **kwargs)
+
+        opt_fn = torch.compile(
+            fn,
+            backend=aot_autograd(
+                fw_compiler=regional_inductor_with_fuse_regions,
+                bw_compiler=regional_inductor_with_fuse_regions,
+            ),
+            fullgraph=True,
+        )
+
+        x = torch.randn(10, requires_grad=True)
+        y = torch.randn(10, requires_grad=True)
+
+        with _testing_capture_invoke_subgraph_inductor_compile_gms() as captured_gms:
+            result, codes = run_fw_bw_and_get_code(lambda: opt_fn(x, y))
+
+        self.assertEqual(result, fn(x, y))
+        self.assertEqual(len(codes), 2)
+        self.assertEqual(len(captured_gms), 2)
+        self.assertEqual(len(captured_outer_gms), 2)
+        for gm in captured_outer_gms:
+            self._assert_wrapped_invoke_subgraphs(gm)
+
     def test_custom_decomposition(self):
         # Test that custom decompositions are applied to the subgraph.
 

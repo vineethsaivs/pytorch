@@ -8966,11 +8966,11 @@ def flex_gemm_lowering(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
 
 
 # Import the control_deps_op HOP for lowering
-from torch._inductor.fx_passes.control_dependencies import control_deps
+from torch._inductor.fx_passes.control_dependencies import control_deps, FUSE_REGION
 
 
 @register_lowering(control_deps, type_promotion_kind=None)
-def control_deps_op_lowering(additional_deps, subgraph_fn, *args):
+def control_deps_op_lowering(additional_deps, subgraph_fn, *args, fuse_region=False):
     """
     Lower control_deps_op by ensuring dependencies are realized and tracking them.
 
@@ -9005,6 +9005,18 @@ def control_deps_op_lowering(additional_deps, subgraph_fn, *args):
     if len(args) + arg_offset != len(original_args):
         raise AssertionError("expected: len(args) + arg_offset == len(original_args)")
 
+    if fuse_region:
+        # Boundary inputs must be materialized before operation_len so their
+        # producer ops stay outside the annotated region.
+        for arg in args:
+            arg_ir_nodes = [
+                arg_leaf
+                for arg_leaf in pytree.tree_leaves(arg)
+                if isinstance(arg_leaf, IRNode)
+            ]
+            for arg_ir_node in arg_ir_nodes:
+                arg_ir_node.realize()
+
     operation_len = len(V.graph.operations)
     if len(subgraph_fn.graph_module.graph.find_nodes(op="placeholder")) != len(args):
         raise AssertionError(
@@ -9014,10 +9026,24 @@ def control_deps_op_lowering(additional_deps, subgraph_fn, *args):
     # Process subgraph nodes using the shared helper
     output = process_subgraph_nodes(subgraph_fn.graph_module, list(args))
 
-    if not (additional_deps):
+    # Ordering control_deps must have an ordering input. fuse_region can use
+    # an empty dependency tuple because its purpose is only to mark a fusion region.
+    if not (additional_deps) and not fuse_region:
         raise AssertionError("expected: additional_deps")
 
     new_ops = V.graph.operations[operation_len:]
+
+    if fuse_region:
+        region = V.graph.current_node.name
+        for op in new_ops:
+            if not hasattr(op, "annotations"):
+                continue
+            existing_region = op.annotations.get(FUSE_REGION)
+            if existing_region is not None and existing_region != region:
+                raise AssertionError(
+                    f"expected one fuse_region per op, got {existing_region} and {region}"
+                )
+            op.annotations[FUSE_REGION] = region
 
     # Store buffer names of void ops (e.g. record_event has NoneLayout) so that
     # subsequent control_deps nodes (e.g. wait_event) can depend on them even

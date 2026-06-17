@@ -379,7 +379,7 @@ def _wrap_sync_node(
     """
     from torch._inductor.fx_passes.control_dependencies import (
         _create_subgraph_for_node,
-        control_deps,
+        _insert_control_deps_call,
         get_subgraph_name,
     )
 
@@ -399,19 +399,15 @@ def _wrap_sync_node(
     subgraph_attr_name = get_subgraph_name(gm, sync_node.name)
     setattr(gm, subgraph_attr_name, subgraph_module)
 
-    # Create control_deps call
-    # Note: sync nodes (record_event/wait_event) only take int args, no Node args.
     with graph.inserting_before(sync_node):
         get_subgraph = graph.get_attr(subgraph_attr_name)
-        control_deps_node = graph.call_function(
-            control_deps,
-            args=(
-                tuple(deps_before_sync),  # additional_deps (all deps for ordering)
-                get_subgraph,  # subgraph
-                *deps_with_uses_after_sync,  # only pass through deps that are used
-            ),
-            kwargs={},
-        )
+    # All deps order the sync; only deps with later users are threaded through.
+    control_deps_node = _insert_control_deps_call(
+        graph,
+        get_subgraph,
+        deps_before_sync,
+        deps_with_uses_after_sync,
+    )
 
     # Mark newly created nodes as visited so subsequent syncs don't
     # misclassify them as "after the sync" during replacement.

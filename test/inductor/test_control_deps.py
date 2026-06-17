@@ -1,9 +1,16 @@
 # Owner(s): ["module: inductor"]
 
 import torch
+import torch._inductor.metrics as metrics
 from torch._inductor import config
+from torch._inductor.fx_passes.control_dependencies import (
+    control_deps,
+    FUSE_REGION,
+    mark_fuse_region,
+)
 from torch._inductor.test_case import run_tests, TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
+from torch.fx import Graph, GraphModule
 from torch.testing import FileCheck
 from torch.testing._internal.common_utils import IS_LINUX
 from torch.testing._internal.inductor_utils import (
@@ -14,6 +21,48 @@ from torch.testing._internal.inductor_utils import (
 
 
 class TestControlDeps(InductorTestCase):
+    def test_fuse_region_subgraph_arg_fake_update(self):
+        from torch._inductor.fx_utils import _extract_subgraphs_and_args
+
+        def make_region() -> GraphModule:
+            graph = Graph()
+            x = graph.placeholder("x")
+            nested = graph.placeholder("nested")
+            add = graph.call_function(torch.ops.aten.add.Tensor, (x, 1))
+            mul = graph.call_function(torch.ops.aten.mul.Tensor, (add, 2))
+            graph.output((mul, nested))
+            return GraphModule({}, graph)
+
+        def make_nested() -> GraphModule:
+            graph = Graph()
+            x = graph.placeholder("x")
+            graph.output(graph.call_function(torch.ops.aten.sin.default, (x,)))
+            return GraphModule({}, graph)
+
+        region = make_region()
+        nested = make_nested()
+        outer_graph = Graph()
+        node = outer_graph.call_function(control_deps, args=((), region), kwargs={})
+
+        x = torch.empty(1)
+        subgraphs = {region: None, nested: None}
+        extracted = list(
+            _extract_subgraphs_and_args(
+                node,
+                subgraphs,
+                (),
+                region,
+                x,
+                nested,
+                **{FUSE_REGION: True},
+            )
+        )
+
+        self.assertEqual(len(extracted), 1)
+        self.assertIs(extracted[0][0], region)
+        self.assertIs(extracted[0][1][0], x)
+        self.assertIs(extracted[0][1][1], nested)
+
     @config.patch(reorder_for_locality=False)
     @requires_gpu()
     def test_control_deps_prevents_fusion(self):
@@ -409,6 +458,250 @@ class TestControlDeps(InductorTestCase):
             "no record_event void op appears as an additional_buffer_dep; "
             f"void_names={void_names}, referenced={referenced}",
         )
+
+    @config.patch(reorder_for_locality=False)
+    @requires_gpu()
+    def test_control_deps_fuse_region_single_region(self):
+        def fn(x):
+            before = x + 1
+            region0 = x * 2
+            region1 = torch.relu(region0)
+            after = x + 3
+            return before, region1, after
+
+        def add_fuse_region(graph):
+            mul_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.mul.Tensor
+            )[0]
+            relu_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.relu.default
+            )[0]
+            mark_fuse_region(graph, [mul_node, relu_node])
+            return graph
+
+        with torch._inductor.config.patch(
+            post_grad_custom_post_pass=add_fuse_region,
+        ):
+            x = torch.rand([256, 256], device=GPU_TYPE)
+            result, code = run_and_get_code(torch.compile(fn), x)
+
+        torch.testing.assert_close(result, fn(x))
+        FileCheck().check("fused_add").check("fused_mul_relu").run(code[0])
+
+    @config.patch(reorder_for_locality=False)
+    @requires_gpu()
+    def test_control_deps_fuse_region_keeps_outside_fusable(self):
+        def fn(x):
+            before = x + 1
+            region0 = x * 2
+            region1 = torch.relu(region0)
+            after = x + 3
+            return before + after, region1
+
+        def add_fuse_region(graph):
+            mul_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.mul.Tensor
+            )[0]
+            relu_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.relu.default
+            )[0]
+            mark_fuse_region(graph, [mul_node, relu_node])
+            return graph
+
+        with torch._inductor.config.patch(
+            post_grad_custom_post_pass=add_fuse_region,
+        ):
+            x = torch.rand([256, 256], device=GPU_TYPE)
+            result, code = run_and_get_code(torch.compile(fn), x)
+
+        torch.testing.assert_close(result, fn(x))
+        FileCheck().check(
+            "Topologically Sorted Source Nodes: [before, after, add_2]"
+        ).check("fused_mul_relu").run(code[0])
+        FileCheck().check_not("fused_add_mul_relu").run(code[0])
+
+    @config.patch(reorder_for_locality=False)
+    @requires_gpu()
+    def test_control_deps_fuse_region_multiple_regions(self):
+        def fn(x):
+            region0 = torch.relu(x * 2)
+            region1 = torch.sigmoid(x + 3)
+            return region0, region1
+
+        def add_fuse_regions(graph):
+            mul_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.mul.Tensor
+            )[0]
+            relu_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.relu.default
+            )[0]
+            add_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.add.Tensor
+            )[0]
+            sigmoid_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.sigmoid.default
+            )[0]
+            mark_fuse_region(graph, [mul_node, relu_node])
+            mark_fuse_region(graph, [add_node, sigmoid_node])
+            return graph
+
+        with torch._inductor.config.patch(
+            post_grad_custom_post_pass=add_fuse_regions,
+        ):
+            x = torch.rand([256, 256], device=GPU_TYPE)
+            result, code = run_and_get_code(torch.compile(fn), x)
+
+        torch.testing.assert_close(result, fn(x))
+        FileCheck().check("fused_mul_relu").check("fused_add_sigmoid").run(code[0])
+        FileCheck().check_not("fused_add_mul_relu_sigmoid").run(code[0])
+
+    @config.patch(reorder_for_locality=False)
+    @requires_gpu()
+    def test_control_deps_fuse_region_multiple_outputs(self):
+        def fn(x):
+            region0 = x * 2
+            region1 = torch.relu(region0)
+            region2 = x + 3
+            region3 = torch.sigmoid(region2)
+            outside = x - 4
+            return region1 + outside, region3 * outside
+
+        def add_fuse_region(graph):
+            mul_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.mul.Tensor
+            )[0]
+            relu_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.relu.default
+            )[0]
+            add_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.add.Tensor
+            )[0]
+            sigmoid_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.sigmoid.default
+            )[0]
+            mark_fuse_region(graph, [mul_node, relu_node, add_node, sigmoid_node])
+            return graph
+
+        with torch._inductor.config.patch(
+            post_grad_custom_post_pass=add_fuse_region,
+        ):
+            x = torch.rand([256, 256], device=GPU_TYPE)
+            result, code = run_and_get_code(torch.compile(fn), x)
+
+        torch.testing.assert_close(result, fn(x))
+        FileCheck().check("fused_add_mul_relu_sigmoid").run(code[0])
+
+    @config.patch(reorder_for_locality=False)
+    @requires_gpu()
+    def test_control_deps_fuse_region_interleaved_input(self):
+        def fn(x):
+            region0 = x * 2
+            outside = x + 3
+            region1 = region0 + outside
+            region2 = torch.relu(region1)
+            after = x - 4
+            return region2, after
+
+        def add_fuse_region(graph):
+            mul_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.mul.Tensor
+            )[0]
+            add_node = next(
+                node
+                for node in graph.find_nodes(
+                    op="call_function", target=torch.ops.aten.add.Tensor
+                )
+                if mul_node in node.all_input_nodes
+            )
+            relu_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.relu.default
+            )[0]
+            mark_fuse_region(graph, [mul_node, add_node, relu_node])
+            return graph
+
+        with torch._inductor.config.patch(
+            post_grad_custom_post_pass=add_fuse_region,
+        ):
+            x = torch.rand([256, 256], device=GPU_TYPE)
+            result, code = run_and_get_code(torch.compile(fn), x)
+
+        torch.testing.assert_close(result, fn(x))
+        FileCheck().check("fused_add_sub").check("fused_add_mul_relu").run(code[0])
+
+    def test_mark_fuse_region_rejects_boundary_cycle(self):
+        def fn(x):
+            region0 = x * 2
+            outside = region0 + 3
+            region1 = torch.relu(outside)
+            return region1
+
+        gm = torch.fx.symbolic_trace(fn)
+        mul_node = next(node for node in gm.graph.nodes if node.name == "mul")
+        relu_node = next(node for node in gm.graph.nodes if node.name == "relu")
+
+        with self.assertRaisesRegex(AssertionError, "acyclic"):
+            mark_fuse_region(gm.graph, [mul_node, relu_node])
+
+    def test_mark_fuse_region_allows_no_external_outputs(self):
+        def fn(x):
+            _ = x + 1
+            return x
+
+        gm = torch.fx.symbolic_trace(fn)
+        add_node = next(node for node in gm.graph.nodes if node.name == "add")
+
+        region_node = mark_fuse_region(gm.graph, [add_node])
+        gm.recompile()
+
+        self.assertEqual(region_node.target, control_deps)
+        self.assertIs(region_node.kwargs.get(FUSE_REGION), True)
+        self.assertEqual(region_node.meta["val"], ())
+
+        get_subgraph = region_node.args[1]
+        subgraph = getattr(gm, get_subgraph.target)
+        output_node = next(node for node in subgraph.graph.nodes if node.op == "output")
+        self.assertEqual(output_node.args[0], ())
+
+        x = torch.ones(2, 2)
+        self.assertEqual(gm(x), fn(x))
+
+    @config.patch(
+        {
+            "reorder_for_locality": False,
+            "combo_kernels": True,
+            "benchmark_combo_kernel": False,
+            "combo_kernel_max_distance": -1,
+            "combo_kernel_peak_memory_increase_gb": None,
+            "combo_kernel_peak_memory_pct_threshold": None,
+        }
+    )
+    @requires_gpu()
+    def test_control_deps_fuse_region_blocks_combo_kernel(self):
+        def fn(x):
+            region = torch.relu(x * 2)
+            outside = torch.sigmoid(x + 3)
+            return region, outside
+
+        def add_fuse_region(graph):
+            mul_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.mul.Tensor
+            )[0]
+            relu_node = graph.find_nodes(
+                op="call_function", target=torch.ops.aten.relu.default
+            )[0]
+            mark_fuse_region(graph, [mul_node, relu_node])
+            return graph
+
+        metrics.reset()
+        with torch._inductor.config.patch(
+            post_grad_custom_post_pass=add_fuse_region,
+        ):
+            x = torch.rand([256, 256], device=GPU_TYPE)
+            result, code = run_and_get_code(torch.compile(fn), x)
+
+        torch.testing.assert_close(result, fn(x))
+        self.assertEqual(metrics.generated_kernel_count, 2)
+        FileCheck().check("fused_mul_relu").check("fused_add_sigmoid").run(code[0])
 
 
 if __name__ == "__main__":

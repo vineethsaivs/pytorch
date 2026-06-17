@@ -230,6 +230,68 @@ jobs:
   # preview can go up as soon as the docs finish, without waiting for the rest
   # of this workflow to conclude.
 
+  test-diff:
+    name: test-diff
+    uses: ./.github/workflows/_test-diff.yml
+    needs:
+      - linux-jammy-py3_10-gcc11-build
+      - get-label-type
+    with:
+      build-environment: ${{ needs.linux-jammy-py3_10-gcc11-build.outputs.build-environment }}
+      docker-image: ${{ needs.linux-jammy-py3_10-gcc11-build.outputs.docker-image }}
+      runner_prefix: "${{ needs.get-label-type.outputs.label-type }}"
+      # mps/xpu simulation from a CPU wheel is unvalidated (needs a Mac/Intel-GPU
+      # runner to confirm); start with the reliably-simulatable set.
+      platforms: "linux-cpu,linux-cuda-sm80,linux-cuda-sm90,linux-rocm"
+    secrets: inherit
+
+  # TEMPORARY (pre-land testing only): posts the test-diff comment from the PR branch
+  # with a write token, so the comment path can be validated before
+  # test-diff-comment.yml is on the default branch (workflow_run only runs from there).
+  # Works for same-repo (branch) PRs, e.g. ghstack; forks are skipped here and covered
+  # by test-diff-comment.yml after landing. DELETE THIS JOB BEFORE LANDING.
+  test-diff-comment-testing:
+    name: test-diff-comment (testing)
+    needs:
+      - test-diff
+      - linux-jammy-py3_10-gcc11-build
+      - get-label-type
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+    # ARC container job (the classic EC2 pool is not provisioned in ARC mode); the build
+    # image just needs python3 -- post_comment is urllib-only and imports no torch.
+    runs-on: "${{ needs.get-label-type.outputs.label-type }}l-x86iavx512-8-64"
+    container:
+      image: ${{ needs.linux-jammy-py3_10-gcc11-build.outputs.docker-image }}
+    permissions:
+      pull-requests: write
+      contents: read
+      actions: read
+    steps:
+      # ARC containers leave GITHUB_WORKSPACE owned by the runner uid, so a bare
+      # checkout's `git init` hits "Permission denied"; setup-linux does this for the
+      # other ARC jobs. 777 lets both the container uid and the GH cleanup hook write.
+      - name: Fix workspace permissions (ARC)
+        shell: bash
+        run: sudo chmod -R 777 "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-diff-result
+      - name: Post sticky comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        # Check the file in-container; hashFiles() (host-evaluated) doesn't see the
+        # artifact written into the ARC container workspace, so it would skip wrongly.
+        run: |
+          if [ -f test-diff-result.json ]; then
+            python3 -m tools.testing.introspection.post_comment test-diff-result.json
+          else
+            echo "no test-diff-result.json artifact; nothing to post"
+          fi
+
   # ╠══════════════════════════════════════════════════════════════════════╣
   # ║ linux-jammy-py3.10-gcc11-no-ops (build only)                         ║
   # ╠══════════════════════════════════════════════════════════════════════╣

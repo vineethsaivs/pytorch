@@ -2861,23 +2861,28 @@ class VariableBuilder:
         # By this point, we should have deduplicated all tensors
         self.assert_not_wrapped_by_this_graph(value)
 
-        if (
-            isinstance(value, torch.Tensor)
-            and value.is_nested
-            and not isinstance(value, torch.nested._internal.nested_tensor.NestedTensor)
-        ):
-            unimplemented(
-                gb_type="Attempted to wrap strided NestedTensor",
-                context="",
-                explanation="torch.compile does not support strided NestedTensor",
-                hints=[],
-            )
+        if isinstance(value, torch.Tensor):
+            with torch._C.DisableTorchFunctionSubclass():
+                is_strided_nested = value.is_nested and not isinstance(
+                    value, torch.nested._internal.nested_tensor.NestedTensor
+                )
+            if is_strided_nested:
+                unimplemented(
+                    gb_type="Attempted to wrap strided NestedTensor",
+                    context="",
+                    explanation="torch.compile does not support strided NestedTensor",
+                    hints=[],
+                )
 
         # TODO(pearu,sparse-team) - Add the corresponding SPARSE_TENSOR_MATCH guards
-        if (
-            isinstance(value, torch.Tensor)
-            and is_sparse_any(value)
-            and (not self.tx.export or not config.capture_sparse_compute)
+        if isinstance(value, torch.Tensor):
+            with torch._C.DisableTorchFunctionSubclass():
+                is_sparse_tensor = is_sparse_any(value)
+        else:
+            is_sparse_tensor = False
+
+        if is_sparse_tensor and (
+            not self.tx.export or not config.capture_sparse_compute
         ):
             # A hot fix for sparse tensors + torch.compile. Support for
             # export + sparsity is being added but we need to create
@@ -2889,17 +2894,23 @@ class VariableBuilder:
                 hints=[*graph_break_hints.SPARSE_TENSOR],
             )
 
-        if (
-            safe_has_grad(value)
-            and safe_grad(value) is not None
-            # type: ignore[attr-defined]
-            and value.dtype != safe_grad(value).dtype
-        ):
-            safe_grad_val = safe_grad(value)
+        if isinstance(value, torch.Tensor):
+            with torch._C.DisableTorchFunctionSubclass():
+                safe_grad_val = safe_grad(value) if safe_has_grad(value) else None
+                value_dtype = value.dtype
+                has_grad_dtype_mismatch = (
+                    safe_grad_val is not None and value_dtype != safe_grad_val.dtype
+                )
+        else:
+            safe_grad_val = None
+            value_dtype = None
+            has_grad_dtype_mismatch = False
+
+        if has_grad_dtype_mismatch:
             grad_str = str(safe_grad_val.dtype) if safe_grad_val is not None else "None"
             unimplemented(
                 gb_type="dtype mismatch between tensor and its gradient",
-                context=f"tensor dtype: {value.dtype}; grad dtype: {grad_str}",
+                context=f"tensor dtype: {value_dtype}; grad dtype: {grad_str}",
                 explanation="Inconsistent dtype between tensor and its gradient. "
                 "This can happen in FSDP and crashes meta tensor creation.",
                 hints=[*graph_break_hints.SUPPORTABLE],
@@ -2941,12 +2952,16 @@ class VariableBuilder:
         # without graph breaking.
         self.tx.output.side_effects.track_object_existing(value, tensor_variable)
 
-        if value._is_view():
+        with torch._C.DisableTorchFunctionSubclass():
+            is_view = value._is_view()
+            view_base = value._base if is_view else None
+
+        if is_view:
             # If value is a view, add its base tensor to the tracked fakes list.
             # This is so we are able to access the correct source for its symbolic
             # shape values, in case we need them.
             wrap_to_fake_tensor_and_record(
-                value._base,
+                view_base,
                 tx=self.tx,
                 source=AttrSource(source, "_base"),
                 is_tensor=True,
@@ -4251,11 +4266,16 @@ def record_automatic_dynamic(
     tx: "InstructionTranslatorBase", name: str, e: torch.Tensor
 ) -> FrameStateSizeEntry:
     # This mimics stride inference algorithm in _create_symbolic_sizes_strides_storage_offset
-    ex_size = e.size()
-    if not is_sparse_any(e):
-        ex_stride = e.stride()
-        dim = e.dim()
+    ex_stride = ()
+    dim = 0
+    with torch._C.DisableTorchFunctionSubclass():
+        ex_size = e.size()
+        is_sparse_tensor = is_sparse_any(e)
+        if not is_sparse_tensor:
+            ex_stride = e.stride()
+            dim = e.dim()
 
+    if not is_sparse_tensor:
         stride = [None] * dim
         pending = [(ex_stride[i], -i) for i in range(dim)]
         pending.sort(key=_nested_int_aware_sort)
@@ -4365,21 +4385,25 @@ def _symbolic_context_from_shapes_spec(
     view_base_context: SymbolicContext | None,
     shape_env_to_source_to_symbol_cache: dict[Any, Any],
 ) -> StatefulSymbolicContext:
-    if tensor_spec is not None and len(tensor_spec) != e.dim():
+    with torch._C.DisableTorchFunctionSubclass():
+        e_dim = e.dim()
+        e_size = e.size()
+
+    if tensor_spec is not None and len(tensor_spec) != e_dim:
         raise ValueError(
             f"TensorSpec has {len(tensor_spec)} dims but tensor {source.name} "
-            f"has {e.dim()} dims"
+            f"has {e_dim} dims"
         )
     dynamic_sizes = []
-    dynamic_strides = [DimDynamic.INFER_STRIDE] * e.dim()
+    dynamic_strides = [DimDynamic.INFER_STRIDE] * e_dim
 
-    for i in range(e.dim()):
+    for i in range(e_dim):
         if tensor_spec is None:
             dynamic_sizes.append(DimDynamic.STATIC)
         else:
             dim_spec = tensor_spec[i]
             if isinstance(dim_spec, int):
-                actual_size = e.size(i)
+                actual_size = e_size[i]
                 if actual_size != dim_spec:
                     raise ValueError(
                         f"shapes_spec declares dim {i} as static with value "
@@ -4566,9 +4590,15 @@ def _automatic_dynamic(
     tensor_spec: TensorSpec | None = None,
 ) -> SymbolicContext:
     # strided NT not supported
-    if e.is_nested and not isinstance(
-        e, torch.nested._internal.nested_tensor.NestedTensor
-    ):
+    with torch._C.DisableTorchFunctionSubclass():
+        is_strided_nested = e.is_nested and not isinstance(
+            e, torch.nested._internal.nested_tensor.NestedTensor
+        )
+        is_view = e._is_view()
+        view_base = e._base if is_view else None
+        e_size = e.size()
+        e_dim = e.dim()
+    if is_strided_nested:
         unimplemented(
             gb_type="Encountered strided NestedTensor in automatic dynamic dim determination",
             context="",
@@ -4584,9 +4614,11 @@ def _automatic_dynamic(
 
     # Get base context if the tensor is a view
     view_base_context: SymbolicContext | None = None
-    if e._is_view():
+    if is_view:
         base_source = AttrSource(source, "_base")
-        view_base_context = _automatic_dynamic(e._base, tx, base_source, static_shapes)
+        view_base_context = _automatic_dynamic(
+            view_base, tx, base_source, static_shapes
+        )
 
     if is_traceable_wrapper_subclass(e) and not outer_only:
         # Get symbolic context for outer tensor
@@ -4633,7 +4665,7 @@ def _automatic_dynamic(
     # make_fx(torch.cond, tracing_mode="symbolic")(*args), inputs have SymInt sizes.
     from torch.fx.experimental.symbolic_shapes import has_guarding_hint, is_nested_int
 
-    if any(isinstance(s, SymInt) and not is_nested_int(s) for s in e.size()):
+    if any(isinstance(s, SymInt) and not is_nested_int(s) for s in e_size):
 
         def _classify_symint(s: Any) -> DimDynamic:
             if not isinstance(s, SymInt):
@@ -4643,10 +4675,10 @@ def _automatic_dynamic(
             return DimDynamic.DYNAMIC
 
         return StatefulSymbolicContext(
-            dynamic_sizes=[_classify_symint(s) for s in e.size()],
-            dynamic_strides=[DimDynamic.INFER_STRIDE] * e.dim(),
-            constraint_sizes=[None] * e.dim(),
-            constraint_strides=[None] * e.dim(),
+            dynamic_sizes=[_classify_symint(s) for s in e_size],
+            dynamic_strides=[DimDynamic.INFER_STRIDE] * e_dim,
+            constraint_sizes=[None] * e_dim,
+            constraint_strides=[None] * e_dim,
             view_base_context=view_base_context,
             tensor_source=source,
             shape_env_to_source_to_symbol_cache=shape_env_to_source_to_symbol_cache,
@@ -4661,10 +4693,10 @@ def _automatic_dynamic(
     # progressive PGO warm-up that consumers (e.g. test_pgo_dynamic_params) rely on.
     if config._shapes_spec is None and static_shapes and not is_dynamic_source(name):
         return StatefulSymbolicContext(
-            dynamic_sizes=[DimDynamic.STATIC] * e.dim(),
-            dynamic_strides=[DimDynamic.INFER_STRIDE] * e.dim(),
-            constraint_sizes=[None] * e.dim(),
-            constraint_strides=[None] * e.dim(),
+            dynamic_sizes=[DimDynamic.STATIC] * e_dim,
+            dynamic_strides=[DimDynamic.INFER_STRIDE] * e_dim,
+            constraint_sizes=[None] * e_dim,
+            constraint_strides=[None] * e_dim,
             view_base_context=view_base_context,
             tensor_source=source,
             shape_env_to_source_to_symbol_cache=shape_env_to_source_to_symbol_cache,
@@ -4724,7 +4756,7 @@ def _automatic_dynamic(
     constraint_strides = []
     specialize_on = []
 
-    for i in range(e.dim()):
+    for i in range(e_dim):
         # NB: mark dynamic has precedence over static
         marked_strict_unbacked = i in getattr(e, "_dynamo_strict_unbacked_indices", ())
         marked_unbacked = i in getattr(e, "_dynamo_unbacked_indices", ())
@@ -4757,7 +4789,7 @@ def _automatic_dynamic(
             # up when we initially created the FrameStateSizeEntry to bong
             # into the mutable state
             log.debug("automatic dynamic %s marked dynamic", name)
-            mark_size = [auto_unset] * e.dim()
+            mark_size = [auto_unset] * e_dim
             # pyrefly: ignore [unsupported-operation]
             mark_size[i] = auto_dynamic
             # pyrefly: ignore [bad-argument-type]
@@ -4778,12 +4810,12 @@ def _automatic_dynamic(
             log.debug("%s dim %d marked dynamic via dynamic-sources list", name, i)
             automatic_dynamic_size = True
 
-        if is_dynamic_value(e.size(i)):
+        if is_dynamic_value(e_size[i]):
             log.debug(
                 "%s dim %d marked dynamic via dynamic-values list (value=%s)",
                 name,
                 i,
-                e.size(i),
+                e_size[i],
             )
             automatic_dynamic_size = True
 
@@ -4847,7 +4879,7 @@ def _automatic_dynamic(
             constraint_size is not None
             or marked_dynamic
             or marked_weak_dynamic
-            or is_nested_int(e.size()[i])
+            or is_nested_int(e_size[i])
         ):
             # NB: We could assert static_shapes is False here, but it
             # seems better to allow the user to override symbolic_context in this
@@ -4958,10 +4990,13 @@ def _wrap_to_fake_tensor_and_record_impl(
             inner_context_name = source.member
             symbolic_context = parent_context.inner_contexts[inner_context_name]
 
+        with torch._C.DisableTorchFunctionSubclass():
+            e_shape = tuple(e.shape)
+
         log.debug(
             "wrap_to_fake %s %s %s %s",
             source.name,
-            tuple(e.shape),
+            e_shape,
             symbolic_context,
             type(e),
         )
@@ -4974,13 +5009,14 @@ def _wrap_to_fake_tensor_and_record_impl(
         with enable_python_dispatcher():
             if tx.fake_mode is None:
                 raise AssertionError("tx.fake_mode must not be None")
-            fake_e = wrap_fake_exception(
-                lambda: tx.fake_mode.from_tensor(
-                    e,  # type: ignore[arg-type]
-                    source=source,
-                    symbolic_context=symbolic_context,
+            with torch._C.DisableTorchFunctionSubclass():
+                fake_e = wrap_fake_exception(
+                    lambda: tx.fake_mode.from_tensor(
+                        e,  # type: ignore[arg-type]
+                        source=source,
+                        symbolic_context=symbolic_context,
+                    )
                 )
-            )
         if tensor_spec is not None:
             for dim_i in range(fake_e.dim()):
                 dim_spec = tensor_spec[dim_i]

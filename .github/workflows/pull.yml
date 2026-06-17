@@ -43,7 +43,9 @@ jobs:
     name: job-filter
     uses: ./.github/workflows/job-filter.yml
     with:
-      jobs-to-include: ${{ github.event.inputs.jobs-to-include || '' }}
+      # TEMPORARY (testintro iteration only): restrict pull to just the testintro
+      # feature jobs (gcc11 build + test-diff + comment). Restore to '' before landing.
+      jobs-to-include: ${{ github.event.inputs.jobs-to-include || 'test-diff' }}
 
   llm-td:
     if: github.repository_owner == 'pytorch'
@@ -70,7 +72,10 @@ jobs:
   # ╠══════════════════════════════════════════════════════════════════════╣
 
   linux-jammy-py3_10-gcc11-build:
-    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' linux-jammy-py3.10-gcc11 ') }}
+    # TEMPORARY: the ' test-diff ' clause keeps this build alive under the iteration
+    # filter (test-diff reuses it) while the gcc11 test shards stay filtered out.
+    # Remove the ' test-diff ' clause before landing.
+    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' linux-jammy-py3.10-gcc11 ') || contains(needs.job-filter.outputs.jobs, ' test-diff ') }}
     name: linux-jammy-py3.10-gcc11
     uses: ./.github/workflows/_linux-build.yml
     needs:

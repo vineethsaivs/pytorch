@@ -6,6 +6,7 @@
 
 #include <ATen/PythonTorchFunctionTLS.h>
 #include <fmt/format.h>
+// @allow-raw-throw
 
 using torch::autograd::utils::wrap;
 
